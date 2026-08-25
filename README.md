@@ -21,8 +21,9 @@
 直接把下面这段话发给你的 AI 助手（Claude Code / Cursor / Windsurf 等），AI 会自动完成所有安装和配置：
 
 ```
-请阅读 https://github.com/dj931567261/lanhu-mcp 项目中的 ai-install-guide.md 文件，
-按照里面的步骤帮我安装和配置这个蓝湖 MCP 服务器。
+请阅读 https://github.com/WoKee/lanhu-mcp/blob/self/ai-install-guide.md 文件，
+从 https://github.com/WoKee/lanhu-mcp.git 的 self 分支克隆项目，
+按照指南帮我安装和配置这个蓝湖 MCP 服务器。
 ```
 
 或者如果你已经克隆了项目：
