@@ -2,4 +2,9 @@ policy:
   allow_implicit_invocation: false
 interface:
   display_name: "Lanhu → Android XML Plan"
-  short_description: "Lanhu URL → XML layouts with strict dimen mapping and 7-set dimens sync"
+  short_description: "Lanhu → block-approved Android XML with relational constraints"
+dependencies:
+  tools:
+    - type: mcp
+      value: lanhu
+      description: "Lanhu design annotations, screenshots, slices, and AI analysis data"
