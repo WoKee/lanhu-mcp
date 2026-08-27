@@ -151,7 +151,7 @@ description: 输入蓝湖设计图详情 URL（含 image_id），先通过 lanhu
    - 只有 TextView 本身承担按钮、Tab、筛选项、胶囊背景或固定点击区域时才允许固定高度，并在区块方案中标记 `height_strategy=fixed_control` 及原因
    - 默认不输出 `android:lineHeight`、`android:includeFontPadding`、`android:lineSpacingExtra` 或 `android:lineSpacingMultiplier`，沿用 Android 与目标项目的字体度量
    - 只有多行文本存在明确行距要求，且项目已有相同实现或用户明确确认时，才允许设置 `lineHeight`/行距属性，并记录 `line_height_strategy=explicit` 及依据
-   - 单行文字的纵向关系使用 baseline、上下约束或固定控件的 `gravity` 表达；禁止用固定文本高度、`lineHeight` 或 `includeFontPadding=false` 修补对齐
+   - 单行文字的纵向关系优先使用同 top、同 bottom 或相对同一稳定目标的 top+bottom 双向约束，固定控件可使用 `gravity`；尽量不使用 `app:layout_constraintBaseline_toBaselineOf`，只有上下约束无法稳定表达明确的排版基线关系时才允许作为例外；禁止用固定文本高度、`lineHeight` 或 `includeFontPadding=false` 修补对齐
    - 多行文字通过可用宽度、`maxLines`、`ellipsize` 和项目既有换行策略控制，禁止依赖固定高度裁切内容
 
 5) **shape 类背景优先复用 `View.changeBg()`**：
@@ -218,7 +218,7 @@ description: 输入蓝湖设计图详情 URL（含 image_id），先通过 lanhu
    - annotations 的绝对坐标是关系推断与结果校验依据，不得默认把每个元素实现为相对 `parent` 的独立 `marginStart/marginTop + 固定宽高`
    - `measurements.sibling_spacings` 和坐标差值只有在锚点关系确定后才能作为 margin；不得因为存在 `gap_to_next` 就跳过拓扑分析
 2. **区块方案必须完成约束拓扑分析**：
-   - 聚类相同或因整数归一产生 `<=1dp` 误差的 left/right/centerX/centerY/baseline，识别共享边缘、列、行和对齐组
+   - 聚类相同或因整数归一产生 `<=1dp` 误差的 left/right/centerX/centerY/baseline，识别共享边缘、列、行和对齐组；baseline 默认只作为测量证据，不自动映射为 XML baseline 约束
    - 从截图业务语义与重复几何共同识别 `layout_role=fixed|flexible|equal_weight|wrap_content`
    - 每个横向区块必须声明 `width_delta_owner`，明确屏幕变窄或变宽时由哪个 View/区域吸收宽度变化
    - 无法解释的相对 `parent` 绝对定位必须标记 `constraint_strategy=absolute_exception` 并给出原因；没有原因时禁止批准方案
@@ -230,10 +230,11 @@ description: 输入蓝湖设计图详情 URL（含 image_id），先通过 lanhu
 4. **等价元素使用等分关系**：
    - 同一业务区域内语义等价且视觉等分的元素，使用 `0dp + 相同 horizontal_weight` 的 chain，或由共享 Guideline 明确等分
    - 每个单元内部的图标与数值组成 packed 关系并在单元内居中；说明文字约束到单元中心，禁止分别使用相对 parent 的绝对 margin 模拟三等分
-5. **文字、图标和色块优先使用语义对齐**：
-   - 属于同一文本行、需要共享书写基线的文字优先使用 `baselineToBaselineOf`；若设计语义是相对某个区块整体上下居中或共享边缘，则使用上下约束或共享边缘，并在方案中说明对齐依据
+5. **文字、图标和色块优先使用上下约束表达语义对齐**：
+   - 同一文本行的文字默认使用同 top、同 bottom 或相对同一稳定目标的 top+bottom 双向约束来表达共享边缘或垂直居中；尽量不使用 `app:layout_constraintBaseline_toBaselineOf`
+   - 只有设计明确要求共享排版基线，且 top/bottom 约束因字号、字体度量或动态内容差异无法稳定复原时，才允许使用 `app:layout_constraintBaseline_toBaselineOf`；区块方案必须标记 `baseline_strategy=required_exception` 并说明 `baseline_exception_reason`
    - 图标、色块与文字行通过上下约束居中；禁止用各自独立的纵向 margin 模拟同一对齐关系
-   - 重复的多行说明使用垂直 chain、共享基线或稳定行容器；禁止为每个成员分别计算独立 `marginTop` 来模拟对齐
+   - 重复的多行说明使用垂直 chain、共享 top/bottom 边缘或稳定行容器；禁止为每个成员分别计算独立 `marginTop` 来模拟对齐
    - 单个文本框的 source bbox 高度不代表运行时 TextView 高度；文本对齐不得依赖固定高度
 6. **锚点优先级**：
    - 优先顺序为：稳定 `parent/Guideline` -> chain/Barrier -> 稳定同级容器 -> 不会隐藏的同级 View -> 有理由的绝对定位例外
@@ -242,7 +243,7 @@ description: 输入蓝湖设计图详情 URL（含 image_id），先通过 lanhu
    - 垂直间距 = `next_element.position.y - (current_element.position.y + current_element.size.height)`
    - 水平间距 = `next_element.position.x - (current_element.position.x + current_element.size.width)`
    - 禁止使用"大约"、"看起来像"等估算；但计算出的间距只能应用到已确定且 source/runtime 边界语义一致的相对关系，不能反过来替代关系推断
-   - TextView 使用 `wrap_content` 和平台默认字体度量时，运行时外边界不等于设计工具的文本 bbox；文本 bbox 差值主要用于复原校验，不得直接转成逐文本 margin。文本间优先使用 baseline，文本与其他元素优先约束到稳定行/单元容器，再使用容器或明确锚点的精确间距
+   - TextView 使用 `wrap_content` 和平台默认字体度量时，运行时外边界不等于设计工具的文本 bbox；文本 bbox 差值主要用于复原校验，不得直接转成逐文本 margin。文本间及文本与其他元素优先使用 top/bottom 约束到稳定行、单元容器或明确锚点；baseline 仅按已说明原因的例外策略使用
 8. **容器优先级与居中表达**：
    - 页面根布局和普通内容容器优先使用 `ConstraintLayout`
    - `layout_direction = horizontal|vertical` 时，优先使用同一 `ConstraintLayout` 内的相对约束或 chain
@@ -393,9 +394,10 @@ Preview 分支：
 - `width_strategy=wrap_content|match_constraint|fixed_dp | height_strategy=wrap_content|match_constraint|fixed_control|fixed_non_text`
 - `container_role=block_root|internal|not_applicable | container_reason=<runtime responsibility|constraint_scope_required|not_applicable> | flattening_audit=passed|not_applicable`
 - `width_delta_owner=<component|region|parent_free_space|not_applicable> | column_group | chain_group | alignment_group`
-- `alignment_strategy=baseline|center_vertical|shared_edge|container_center|not_applicable | alignment_reason`
+- `alignment_strategy=top_bottom|center_vertical|shared_edge|container_center|baseline_exception|not_applicable | alignment_reason`
+- `baseline_strategy=avoided|required_exception|not_applicable | baseline_exception_reason=<top/bottom 无法稳定表达的具体原因|not_applicable>`
 - `centering_strategy=dual_anchor_default_bias|chain|explicit_bias|explicit_margins|not_applicable | symmetric_margin_reason=match_constraint_size|minimum_edge_spacing|intentional_bias|not_applicable`
-- `constraint_strategy=relative|chain|guideline|barrier|baseline|absolute_exception | absolute_exception_reason`
+- `constraint_strategy=relative|chain|guideline|barrier|baseline_exception|absolute_exception | absolute_exception_reason`
 - `constraint_anchor_start/end/top/bottom | chain_style | weight | stable_anchor`
 - `text_size_sp=<value|not_applicable> | text_height_strategy=wrap_content|fixed_control|not_applicable | text_overflow`
 - `line_height_strategy=default|explicit|not_applicable | include_font_padding=default|explicit|not_applicable | explicit_text_metric_reason`
@@ -416,7 +418,7 @@ Preview 分支：
 - 表头和重复行未共享 `column_group`，或重复列分别使用相对 parent 的绝对 margin
 - 名称/标题位于固定前后区域之间却未使用弹性宽度，也未声明 `width_delta_owner`
 - 语义等价的等分项未使用等权 chain/共享 Guideline，也没有例外原因
-- 具备同一文本行语义的文字未采用 baseline，且未说明其他对齐方式更符合设计的理由；或图标/色块与文字用独立纵向 margin 模拟对齐
+- 文本使用 `app:layout_constraintBaseline_toBaselineOf`，却未标记 `baseline_strategy=required_exception`，或未说明 top/bottom 约束无法稳定表达的具体原因；或图标/色块与文字用独立纵向 margin 模拟对齐
 - 设计明确要求特殊字体却为 `FONT_UNRESOLVED`，或既有非 Data Binding 布局需要迁移但 `font_layout_mode=needs_input`
 - `app:fontType` 用于非 TextView、非 Data Binding 布局、非 `@{0}` 到 `@{3}` 表达式，或仅因通用粗体而错误选择 `fontType_1`
 - 使用 `absolute_exception` 但未给出原因
@@ -432,7 +434,7 @@ Preview 分支：
 4. 已实现区块仅允许本轮当前区块范围内的修改；禁止为了方便重构其他已批准或未批准区块。
 5. Kotlin 只允许在已定位宿主中，通过现有 ViewBinding/DataBinding 等方式调用 `View.changeBg()` 设置样式；禁止动态创建 View、`findViewById` 或 `addView`。
 6. 为当前区块的动态文本、动态图片、延后切图和运行时 `changeBg()` 补充必要 `tools:*`，但遵守根 Preview 尺寸禁令。
-7. 只做当前区块的 XML 解析、资源/ID/同父约束、文本策略、字体映射与 Data Binding 语法、内部容器必要性、居中边距冗余、宽度扰动和 GONE 状态定向检查；除非用户明确要求，不运行全量构建。所有定向静态检查必须通过后才能进入 `preview_choice_pending`；检查失败时先在已批准方案内修正并重跑，若失败说明方案拓扑不成立则退回 `block_plan_pending`，禁止提供“跳过验收”选项。
+7. 只做当前区块的 XML 解析、资源/ID/同父约束、文本策略、baseline 例外、字体映射与 Data Binding 语法、内部容器必要性、居中边距冗余、宽度扰动和 GONE 状态定向检查；除非用户明确要求，不运行全量构建。所有定向静态检查必须通过后才能进入 `preview_choice_pending`；检查失败时先在已批准方案内修正并重跑，若失败说明方案拓扑不成立则退回 `block_plan_pending`，禁止提供“跳过验收”选项。
 8. 定向静态检查全部通过后，输出 `BLOCK_IMPLEMENTED`、变更文件和检查结果，然后询问：`是否需要 AI 根据 Android Studio Preview 与蓝湖截图验收当前 <block_id>？请回复 AI验收 或 跳过验收。` 状态记为 `preview_choice_pending` 并停止。
 9. 在用户选择前禁止打开 Preview、捕获截图或执行视觉对比；用户最初的“写 XML”授权不代表选择了 AI 验收。
 
@@ -442,7 +444,7 @@ Preview 分支：
 
 1. 仅渲染和检查当前区块；使用 Android Studio Preview 的设备配置提供 375dp 参考宽度，禁止向 XML 根节点写入 `tools:layout_width/height`。
 2. 获取当前区块 Preview 截图，与蓝湖原图对应区块并排或叠加比较，同时以 annotations 的 bbox、间距、字号、颜色和样式数据做数值核对；不得只凭像素差判断通过与否。
-3. 至少检查固定/弹性/等分关系、公共列、baseline/垂直对齐、TextView 裁切与换行、字体映射、间距、颜色、圆角、边框、Preview 占位和可见状态；`app:fontType` 若未在 Preview 执行，以 annotations 与项目映射的静态审计为准，不得据此误判为默认字体；待下载切图只验收占位区域的尺寸和约束，不验收图片内容。
+3. 至少检查固定/弹性/等分关系、公共列、top/bottom 垂直对齐、baseline 例外必要性、TextView 裁切与换行、字体映射、间距、颜色、圆角、边框、Preview 占位和可见状态；`app:fontType` 若未在 Preview 执行，以 annotations 与项目映射的静态审计为准，不得据此误判为默认字体；待下载切图只验收占位区域的尺寸和约束，不验收图片内容。
 4. 若差异只涉及已批准拓扑内的尺寸、颜色、文案、占位或资源引用，只修改当前区块并重新渲染；若需要改变容器、锚点、列模型、宽度角色或 GONE 行为，退回 `block_plan_pending` 并等待方案重新确认。
 5. AI 自动修正并重新渲染最多两轮；仍有差异时输出剩余问题，状态保持 `ai_preview_review`，询问用户补充调整意见、稍后重试或 `跳过验收`，禁止无限重试或扩大到其他区块。
 6. Preview 无法启动或截图不可读取时，不得声称验收通过，也不得为此运行全量构建；状态保持 `ai_preview_review`，说明阻塞，并重新询问用户选择稍后重试或 `跳过验收`。
