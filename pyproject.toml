@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lanhu-mcp-server"
-version = "1.0.0"
+dynamic = ["version"]
 description = "A powerful MCP server for automatically extracting and analyzing Lanhu design documents"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -40,7 +40,7 @@ classifiers = [
     "Topic :: Software Development :: Documentation",
 ]
 dependencies = [
-    "fastmcp>=0.2.0",
+    "fastmcp>=2.0.0",
     "httpx>=0.27.0",
     "beautifulsoup4>=4.12.0",
     "playwright>=1.48.0",
@@ -74,7 +74,10 @@ Changelog = "https://github.com/dsphper/lanhu-mcp/blob/main/CHANGELOG.md"
 lanhu-mcp = "lanhu_mcp_server:main"
 
 [tool.setuptools]
-py-modules = ["lanhu_mcp_server"]
+py-modules = ["lanhu_mcp_server", "design_cache", "lanhu_version"]
+
+[tool.setuptools.dynamic]
+version = {attr = "lanhu_version.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["."]

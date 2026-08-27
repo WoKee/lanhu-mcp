@@ -128,6 +128,7 @@ args = ["/c", "C:\\path\\to\\lanhu-mcp\\run_lanhu_mcp_stdio.bat"]
 | **设计标注数据（annotations）** | 精确提取图层坐标、尺寸、颜色、字体、间距、圆角等 dp 级参数 |
 | **布局分析** | 兄弟间距、布局方向检测、层级树、最近邻关系 |
 | **设计图分组与搜索** | 按分组查看、按关键词搜索设计图 |
+| **服务版本自检** | 调用 `lanhu_get_server_info` 查询 MCP 版本、提交号和缓存能力 |
 | **Skill 代码生成（8 平台）** | 配合 annotations 数据，约束 AI 生成高还原度 UI 代码 |
 
 ---
@@ -221,6 +222,8 @@ AI 会自动：
 ```
 lanhu-mcp/
 ├── lanhu_mcp_server.py        # MCP 服务端主文件
+├── lanhu_version.py           # Lanhu MCP 版本单一来源
+├── design_cache.py            # 跨进程持久设计缓存
 ├── run_lanhu_mcp_stdio.sh     # MCP 启动脚本（macOS / Linux）
 ├── run_lanhu_mcp_stdio.bat    # MCP 启动脚本（Windows）
 ├── requirements.txt           # Python 依赖

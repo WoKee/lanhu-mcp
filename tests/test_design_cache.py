@@ -380,6 +380,36 @@ class DesignPayloadCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.cache.get_record("design_screenshot", identity))
         self.assertEqual(list(screenshots_dir.glob("*")), [])
 
+    async def test_corrupt_nonempty_screenshot_is_refetched_and_repaired(self):
+        backend = FakeLanhuBackend()
+        extractor = make_extractor(backend)
+        params = {"team_id": TEAM_ID, "project_id": PROJECT_ID}
+        design = {"id": IMAGE_ID, "image_id": IMAGE_ID}
+        screenshots_dir = Path(self.temp_dir.name) / "corrupt-screenshots"
+
+        first = await server._get_design_screenshot_cached(
+            extractor,
+            design,
+            params,
+            screenshots_dir,
+        )
+        screenshot_path = Path(first["screenshot_path"])
+        screenshot_path.write_bytes(b"<html>cached error</html>")
+
+        repaired = await server._get_design_screenshot_cached(
+            extractor,
+            design,
+            params,
+            screenshots_dir,
+        )
+
+        self.assertEqual(backend.screenshot_requests, 2)
+        self.assertEqual(repaired["cache"]["screenshot"]["state"], "miss")
+        self.assertEqual(repaired["cache"]["screenshot"]["source"], "network")
+        self.assertTrue(
+            server._has_supported_image_magic(screenshot_path.read_bytes()[:12])
+        )
+
     async def test_detail_url_uses_image_id_fast_path(self):
         extractor = server.LanhuExtractor.__new__(server.LanhuExtractor)
         url = (

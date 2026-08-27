@@ -11,11 +11,19 @@ import json
 import hashlib
 import copy
 import math
+import subprocess
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import Annotated, Awaitable, Callable, Literal, Optional, Union, List, Any
 
-from design_cache import CacheLockStats, CacheRecord, DesignCache, normalize_cache_policy
+from design_cache import (
+    CACHE_SCHEMA_VERSION,
+    CacheLockStats,
+    CacheRecord,
+    DesignCache,
+    normalize_cache_policy,
+)
+from lanhu_version import __version__ as SERVER_VERSION
 
 # 加载 .env 文件中的环境变量（必须在其他导入之前）
 # 注意：在 Docker 容器中，环境变量通常已由 docker-compose 通过 env_file 设置
@@ -49,7 +57,134 @@ from fastmcp.utilities.types import Image
 from playwright.async_api import async_playwright
 
 # 创建FastMCP服务器
-mcp = FastMCP("Lanhu Axure Extractor")
+SERVER_NAME = "Lanhu Axure Extractor"
+SERVER_FEATURES = (
+    "persistent_design_cache",
+    "cross_process_cache_lock",
+    "version_aware_design_cache",
+    "cache_status_reporting",
+    "cache_policy",
+)
+
+SERVER_INFO_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "server_version": {"type": "string"},
+        "git_commit": {
+            "anyOf": [
+                {"type": "string"},
+                {"type": "null"},
+            ]
+        },
+        "dirty": {
+            "anyOf": [
+                {"type": "boolean"},
+                {"type": "null"},
+            ]
+        },
+        "cache_schema_version": {"type": "integer"},
+        "features": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+    },
+    "required": [
+        "server_version",
+        "git_commit",
+        "dirty",
+        "cache_schema_version",
+        "features",
+    ],
+    "additionalProperties": False,
+}
+
+
+def _resolve_source_checkout_root() -> Optional[Path]:
+    """Return the module directory only when it is this repository's Git root."""
+    source_dir = Path(__file__).resolve().parent
+    try:
+        if not (source_dir / ".git").exists():
+            return None
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=source_dir,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=2,
+            check=False,
+        )
+        root_candidate = result.stdout.strip()
+        if result.returncode != 0 or not root_candidate:
+            return None
+        resolved_root = Path(root_candidate).resolve()
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        return None
+
+    if os.path.normcase(str(resolved_root)) != os.path.normcase(str(source_dir)):
+        return None
+    return source_dir
+
+
+def _resolve_git_commit() -> Optional[str]:
+    """Resolve a safe commit identifier without exposing command output."""
+    configured_commit = os.getenv("LANHU_GIT_COMMIT", "").strip()
+    if configured_commit and re.fullmatch(r"[0-9a-fA-F]{7,64}", configured_commit):
+        return configured_commit.lower()
+
+    source_root = _resolve_source_checkout_root()
+    if source_root is None:
+        return None
+
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD"],
+            cwd=source_root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    candidate = result.stdout.strip()
+    if result.returncode == 0 and re.fullmatch(r"[0-9a-fA-F]{7,64}", candidate):
+        return candidate.lower()
+    return None
+
+
+def _resolve_git_dirty() -> Optional[bool]:
+    """Return whether tracked or untracked source files make the tree dirty."""
+    source_root = _resolve_source_checkout_root()
+    if source_root is None:
+        return None
+
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=source_root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return bool(result.stdout.strip())
+
+
+SERVER_GIT_COMMIT = _resolve_git_commit()
+SERVER_WORKTREE_DIRTY = _resolve_git_dirty()
+
+mcp = FastMCP(SERVER_NAME, version=SERVER_VERSION)
 
 # 全局配置
 DEFAULT_COOKIE = "your_lanhu_cookie_here"  # 请替换为你的蓝湖Cookie，从浏览器开发者工具中获取
@@ -136,6 +271,26 @@ def _build_cache_status(
         "checked_at": _format_cache_timestamp(record.checked_at) if record else now,
         "waited_for_inflight": lock_stats.waited_for_inflight if lock_stats else False,
         "lock_wait_ms": lock_stats.lock_wait_ms if lock_stats else 0,
+    }
+
+
+@mcp.tool(
+    output_schema=SERVER_INFO_OUTPUT_SCHEMA,
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def lanhu_get_server_info() -> dict:
+    """Return this Lanhu MCP build version and non-sensitive feature metadata."""
+    return {
+        "server_version": SERVER_VERSION,
+        "git_commit": SERVER_GIT_COMMIT,
+        "dirty": SERVER_WORKTREE_DIRTY,
+        "cache_schema_version": CACHE_SCHEMA_VERSION,
+        "features": list(SERVER_FEATURES),
     }
 
 
@@ -4873,6 +5028,22 @@ def _validate_design_screenshot_response(
     return content
 
 
+def _load_valid_design_screenshot_record(
+    namespace: str,
+    identity: dict,
+) -> Optional[CacheRecord]:
+    """Return a cached screenshot only when its file still has image content."""
+    record = DESIGN_CACHE.load_artifact(namespace, identity)
+    if not record or not record.artifact_path:
+        return None
+    try:
+        with record.artifact_path.open("rb") as artifact_file:
+            signature = artifact_file.read(12)
+    except OSError:
+        return None
+    return record if _has_supported_image_magic(signature) else None
+
+
 async def _get_design_screenshot_cached(
     extractor: LanhuExtractor,
     design: dict,
@@ -4921,7 +5092,7 @@ async def _get_design_screenshot_cached(
             version_id=version_id,
         )
     else:
-        screenshot_record = DESIGN_CACHE.load_artifact(namespace, identity)
+        screenshot_record = _load_valid_design_screenshot_record(namespace, identity)
         if screenshot_record:
             filepath = screenshot_record.artifact_path
             screenshot_cache = _build_cache_status(
@@ -4932,7 +5103,7 @@ async def _get_design_screenshot_cached(
             )
         else:
             async with DESIGN_CACHE.lock(namespace, identity) as lock_stats:
-                screenshot_record = DESIGN_CACHE.load_artifact(namespace, identity)
+                screenshot_record = _load_valid_design_screenshot_record(namespace, identity)
                 if screenshot_record:
                     filepath = screenshot_record.artifact_path
                     screenshot_cache = _build_cache_status(
@@ -6362,5 +6533,10 @@ async def lanhu_get_members(
     }
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Run the Lanhu MCP server over stdio."""
     mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()
