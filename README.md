@@ -119,6 +119,14 @@ args = ["/c", "C:\\path\\to\\lanhu-mcp\\run_lanhu_mcp_stdio.bat"]
 | `/lanhu-html-plan` | HTML + CSS |
 | `/lanhu-uniapp-plan` | uni-app |
 
+查看 Lanhu MCP 版本号时，在 AI 对话中发送：
+
+```
+请调用 lanhu_get_server_info 查看当前 Lanhu MCP 版本号
+```
+
+返回结果中的 `server_version` 是服务版本号，`git_commit` 是当前提交号，`dirty` 表示本地源码是否包含未提交修改。
+
 ---
 
 ## 🆕 新增功能概览
