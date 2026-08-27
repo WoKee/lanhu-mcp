@@ -13,7 +13,9 @@ import copy
 import math
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-from typing import Annotated, Optional, Union, List, Any
+from typing import Annotated, Awaitable, Callable, Literal, Optional, Union, List, Any
+
+from design_cache import CacheLockStats, CacheRecord, DesignCache, normalize_cache_policy
 
 # 加载 .env 文件中的环境变量（必须在其他导入之前）
 # 注意：在 Docker 容器中，环境变量通常已由 docker-compose 通过 env_file 设置
@@ -55,6 +57,14 @@ DEFAULT_COOKIE = "your_lanhu_cookie_here"  # 请替换为你的蓝湖Cookie，�
 # 从环境变量读取Cookie，如果没有则使用默认值
 COOKIE = os.getenv("LANHU_COOKIE", DEFAULT_COOKIE)
 
+# Keep persistent cache entries isolated by account unless the operator provides
+# an explicit stable scope. The raw Cookie is never stored or returned.
+_configured_design_cache_scope = os.getenv("LANHU_DESIGN_CACHE_SCOPE", "").strip()
+DESIGN_CACHE_SCOPE = _configured_design_cache_scope or (
+    "cookie-sha256-v1:"
+    + hashlib.sha256(COOKIE.encode("utf-8")).hexdigest()
+)
+
 BASE_URL = "https://lanhuapp.com"
 CDN_URL = "https://axure-file.lanhuapp.com"
 
@@ -65,6 +75,20 @@ FEISHU_WEBHOOK_URL = os.getenv("FEISHU_WEBHOOK_URL", DEFAULT_FEISHU_WEBHOOK)
 # 数据存储目录
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# UI design data is shared by every MCP process through this persistent cache.
+DESIGN_CACHE_TTL_SECONDS = max(
+    0.0,
+    float(os.getenv("LANHU_DESIGN_CACHE_TTL", os.getenv("CACHE_TTL", "300")))
+)
+DESIGN_CACHE_LOCK_TIMEOUT_SECONDS = max(
+    1.0,
+    float(os.getenv("LANHU_DESIGN_CACHE_LOCK_TIMEOUT", "330"))
+)
+DESIGN_CACHE = DesignCache(
+    DATA_DIR / "design_cache",
+    lock_timeout_seconds=DESIGN_CACHE_LOCK_TIMEOUT_SECONDS,
+)
 
 # HTTP 请求超时时间（秒）
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "30"))
@@ -79,6 +103,41 @@ VIEWPORT_HEIGHT = int(os.getenv("VIEWPORT_HEIGHT", "1080"))
 
 # 调试模式
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
+
+CachePolicy = Literal["use", "refresh", "bypass"]
+
+
+def _format_cache_timestamp(timestamp: Optional[float]) -> Optional[str]:
+    if timestamp is None:
+        return None
+    return datetime.fromtimestamp(timestamp, timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _build_cache_status(
+    *,
+    state: str,
+    source: str,
+    cache_policy: str,
+    record: Optional[CacheRecord] = None,
+    version_id: Optional[str] = None,
+    previous_version_id: Optional[str] = None,
+    remote_checked: bool = False,
+    lock_stats: Optional[CacheLockStats] = None,
+) -> dict:
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return {
+        "state": state,
+        "source": source,
+        "cache_policy": cache_policy,
+        "version_id": version_id if version_id is not None else (record.version_id if record else None),
+        "previous_version_id": previous_version_id,
+        "remote_checked": remote_checked,
+        "fetched_at": _format_cache_timestamp(record.fetched_at) if record else now,
+        "checked_at": _format_cache_timestamp(record.checked_at) if record else now,
+        "waited_for_inflight": lock_stats.waited_for_inflight if lock_stats else False,
+        "lock_wait_ms": lock_stats.lock_wait_ms if lock_stats else 0,
+    }
+
 
 # 角色枚举（用于识别用户身份）
 VALID_ROLES = ["后端", "前端", "客户端", "开发", "运维", "产品", "项目经理"]
@@ -1384,8 +1443,24 @@ class LanhuExtractor:
         except Exception:
             pass
 
-    async def _fetch_design_payload(self, image_id: str, team_id: str, project_id: str) -> dict:
-        """获取设计图详情及其最新版本 JSON。"""
+    @staticmethod
+    def _design_cache_identity(image_id: str, team_id: str, project_id: str) -> dict:
+        return {
+            "cache_scope": DESIGN_CACHE_SCOPE,
+            "team_id": str(team_id),
+            "project_id": str(project_id),
+            "image_id": str(image_id),
+        }
+
+    @staticmethod
+    def _get_design_version_id(latest_version: dict) -> str:
+        version_id = latest_version.get("id")
+        if not version_id:
+            raise Exception("Design version ID not found")
+        return str(version_id)
+
+    async def _fetch_design_info(self, image_id: str, team_id: str, project_id: str) -> dict:
+        """Fetch design metadata and latest version without downloading the large JSON."""
         url = f"{BASE_URL}/api/project/image"
         params = {
             "dds_status": 1,
@@ -1408,17 +1483,227 @@ class LanhuExtractor:
             raise Exception("Design version info not found")
 
         latest_version = versions[0]
+        self._get_design_version_id(latest_version)
+
+        return {
+            'design': result,
+            'latest_version': latest_version,
+        }
+
+    async def _fetch_design_json(self, latest_version: dict) -> dict:
         json_url = latest_version.get('json_url')
         if not json_url:
             raise Exception("Design JSON URL not found")
 
         json_response = await self.client.get(json_url)
         json_response.raise_for_status()
+        return json_response.json()
+
+    async def _fetch_design_payload(self, image_id: str, team_id: str, project_id: str) -> dict:
+        """Fetch design metadata and JSON directly, bypassing the persistent cache."""
+        design_info = await self._fetch_design_info(image_id, team_id, project_id)
 
         return {
-            'design': result,
+            **design_info,
+            'sketch_data': await self._fetch_design_json(design_info['latest_version'])
+        }
+
+    async def get_design_info_cached(
+        self,
+        image_id: str,
+        team_id: str,
+        project_id: str,
+        cache_policy: str = "use",
+    ) -> tuple[dict, dict]:
+        """Return design metadata with a TTL-based remote version check."""
+        policy = normalize_cache_policy(cache_policy)
+        identity = self._design_cache_identity(image_id, team_id, project_id)
+        namespace = "design_info"
+        request_started = datetime.now(timezone.utc).timestamp()
+        initial_record, initial_payload = DESIGN_CACHE.load_json(namespace, identity)
+
+        if policy == "bypass":
+            design_info = await self._fetch_design_info(image_id, team_id, project_id)
+            version_id = self._get_design_version_id(design_info['latest_version'])
+            return design_info, _build_cache_status(
+                state="bypass",
+                source="network",
+                cache_policy=policy,
+                version_id=version_id,
+                remote_checked=True,
+            )
+
+        if (
+            policy == "use"
+            and initial_record
+            and initial_payload
+            and initial_record.is_fresh(DESIGN_CACHE_TTL_SECONDS)
+        ):
+            return initial_payload, _build_cache_status(
+                state="hit",
+                source="disk",
+                cache_policy=policy,
+                record=initial_record,
+            )
+
+        initial_checked_at = initial_record.checked_at if initial_record else float("-inf")
+        async with DESIGN_CACHE.lock(namespace, identity) as lock_stats:
+            current_record, current_payload = DESIGN_CACHE.load_json(namespace, identity)
+
+            if current_record and current_payload:
+                if policy == "use" and current_record.is_fresh(DESIGN_CACHE_TTL_SECONDS):
+                    return current_payload, _build_cache_status(
+                        state="hit",
+                        source="disk",
+                        cache_policy=policy,
+                        record=current_record,
+                        lock_stats=lock_stats,
+                    )
+                if (
+                    lock_stats.waited_for_inflight
+                    and current_record.checked_at > initial_checked_at
+                    and current_record.checked_at >= request_started
+                ):
+                    return current_payload, _build_cache_status(
+                        state="hit",
+                        source="disk",
+                        cache_policy=policy,
+                        record=current_record,
+                        lock_stats=lock_stats,
+                    )
+
+            design_info = await self._fetch_design_info(image_id, team_id, project_id)
+            version_id = self._get_design_version_id(design_info['latest_version'])
+            previous_version_id = current_record.version_id if current_record else None
+
+            if current_record and current_payload and previous_version_id == version_id:
+                refreshed_record = DESIGN_CACHE.store_json(
+                    namespace,
+                    identity,
+                    design_info,
+                    version_id=version_id,
+                    fetched_at=current_record.fetched_at,
+                    metadata=identity,
+                )
+                return design_info, _build_cache_status(
+                    state="revalidated",
+                    source="network",
+                    cache_policy=policy,
+                    record=refreshed_record,
+                    remote_checked=True,
+                    lock_stats=lock_stats,
+                )
+
+            stored_record = DESIGN_CACHE.store_json(
+                namespace,
+                identity,
+                design_info,
+                version_id=version_id,
+                metadata=identity,
+            )
+            return design_info, _build_cache_status(
+                state="updated" if previous_version_id else "miss",
+                source="network",
+                cache_policy=policy,
+                record=stored_record,
+                previous_version_id=previous_version_id,
+                remote_checked=True,
+                lock_stats=lock_stats,
+            )
+
+    async def get_design_payload_cached(
+        self,
+        image_id: str,
+        team_id: str,
+        project_id: str,
+        cache_policy: str = "use",
+    ) -> dict:
+        """Return the immutable JSON payload for the latest design version."""
+        policy = normalize_cache_policy(cache_policy)
+        design_info, info_cache = await self.get_design_info_cached(
+            image_id=image_id,
+            team_id=team_id,
+            project_id=project_id,
+            cache_policy=policy,
+        )
+        latest_version = design_info['latest_version']
+        version_id = self._get_design_version_id(latest_version)
+        cache_identity = self._design_cache_identity(image_id, team_id, project_id)
+        identity = {
+            **cache_identity,
+            "version_id": version_id,
+        }
+        namespace = "design_payload"
+
+        if policy == "bypass":
+            sketch_data = await self._fetch_design_json(latest_version)
+            payload_cache = _build_cache_status(
+                state="bypass",
+                source="network",
+                cache_policy=policy,
+                version_id=version_id,
+                remote_checked=False,
+            )
+        else:
+            payload_record, sketch_data = await asyncio.to_thread(
+                DESIGN_CACHE.load_json,
+                namespace,
+                identity,
+            )
+            if payload_record and sketch_data is not None:
+                payload_cache = _build_cache_status(
+                    state="hit",
+                    source="disk",
+                    cache_policy=policy,
+                    record=payload_record,
+                )
+            else:
+                async with DESIGN_CACHE.lock(namespace, identity) as lock_stats:
+                    payload_record, sketch_data = await asyncio.to_thread(
+                        DESIGN_CACHE.load_json,
+                        namespace,
+                        identity,
+                    )
+                    if payload_record and sketch_data is not None:
+                        payload_cache = _build_cache_status(
+                            state="hit",
+                            source="disk",
+                            cache_policy=policy,
+                            record=payload_record,
+                            lock_stats=lock_stats,
+                        )
+                    else:
+                        sketch_data = await self._fetch_design_json(latest_version)
+                        payload_record = await asyncio.to_thread(
+                            DESIGN_CACHE.store_json,
+                            namespace,
+                            identity,
+                            sketch_data,
+                            version_id=version_id,
+                            metadata=cache_identity,
+                        )
+                        await asyncio.to_thread(
+                            DESIGN_CACHE.prune_versions,
+                            namespace,
+                            cache_identity,
+                        )
+                        payload_cache = _build_cache_status(
+                            state="updated" if info_cache.get("state") == "updated" else "miss",
+                            source="network",
+                            cache_policy=policy,
+                            record=payload_record,
+                            previous_version_id=info_cache.get("previous_version_id"),
+                            lock_stats=lock_stats,
+                        )
+
+        return {
+            'design': design_info['design'],
             'latest_version': latest_version,
-            'sketch_data': json_response.json()
+            'sketch_data': sketch_data,
+            '_cache': {
+                'design_info': info_cache,
+                'design_payload': payload_cache,
+            },
         }
 
     @staticmethod
@@ -2833,9 +3118,20 @@ class LanhuExtractor:
         converted['measurements'] = cls._convert_measurements_to_dp(converted.get('measurements'), scale)
         return converted
 
-    async def _get_raw_design_annotations_info(self, image_id: str, team_id: str, project_id: str) -> dict:
+    async def _get_raw_design_annotations_info(
+        self,
+        image_id: str,
+        team_id: str,
+        project_id: str,
+        cache_policy: str = "use",
+    ) -> dict:
         """获取原始 px 坐标系下的完整图层规格。"""
-        payload = await self._fetch_design_payload(image_id, team_id, project_id)
+        payload = await self.get_design_payload_cached(
+            image_id=image_id,
+            team_id=team_id,
+            project_id=project_id,
+            cache_policy=cache_policy,
+        )
         design = payload['design']
         latest_version = payload['latest_version']
         sketch_data = payload['sketch_data']
@@ -2864,6 +3160,8 @@ class LanhuExtractor:
             'design_id': str(image_id),
             'design_name': design.get('name'),
             'version': latest_version.get('version_info'),
+            'version_id': self._get_design_version_id(latest_version),
+            'cache': payload['_cache'],
             'canvas_size': {
                 'width': artboard_width,
                 'height': artboard_height
@@ -2874,13 +3172,25 @@ class LanhuExtractor:
             'measurements': self._build_measurements(layers)
         }
 
-    async def get_design_annotations_info(self, image_id: str, team_id: str, project_id: str) -> dict:
+    async def get_design_annotations_info(
+        self,
+        image_id: str,
+        team_id: str,
+        project_id: str,
+        cache_policy: str = "use",
+    ) -> dict:
         """获取设计图的完整图层规格，并将几何尺寸转换为 dp。"""
-        raw_annotations = await self._get_raw_design_annotations_info(image_id, team_id, project_id)
+        raw_annotations = await self._get_raw_design_annotations_info(
+            image_id,
+            team_id,
+            project_id,
+            cache_policy=cache_policy,
+        )
         return self._convert_annotations_to_dp(raw_annotations)
 
     async def get_design_slices_info(self, image_id: str, team_id: str, project_id: str,
-                                     include_metadata: bool = True) -> dict:
+                                     include_metadata: bool = True,
+                                     cache_policy: str = "use") -> dict:
         """
         获取设计图的所有切图信息（仅返回元数据和下载地址，不下载文件）
 
@@ -2893,7 +3203,12 @@ class LanhuExtractor:
         Returns:
             包含切图列表和详细信息的字典
         """
-        annotations = await self._get_raw_design_annotations_info(image_id, team_id, project_id)
+        annotations = await self._get_raw_design_annotations_info(
+            image_id,
+            team_id,
+            project_id,
+            cache_policy=cache_policy,
+        )
         slices = []
 
         for layer in annotations['layers']:
@@ -2940,6 +3255,8 @@ class LanhuExtractor:
             'design_id': annotations['design_id'],
             'design_name': annotations['design_name'],
             'version': annotations['version'],
+            'version_id': annotations['version_id'],
+            'cache': annotations['cache'],
             'canvas_size': annotations['canvas_size'],
             'total_slices': len(slices),
             'slices': slices
@@ -4238,10 +4555,16 @@ async def _get_sectors(extractor: LanhuExtractor, project_id: str) -> dict:
         )
         extractor._check_auth(response)
         if response.status_code != 200:
-            return {'sectors': [], 'image_sector_map': {}}
+            return {
+                'status': 'error',
+                'message': f"Failed to get design sectors: HTTP {response.status_code}",
+            }
         data = response.json()
         if data.get('code') != '00000':
-            return {'sectors': [], 'image_sector_map': {}}
+            return {
+                'status': 'error',
+                'message': data.get('msg', 'Failed to get design sectors'),
+            }
 
         sectors_raw = data.get('data', {}).get('sectors', [])
         image_sector_map = {}
@@ -4258,16 +4581,20 @@ async def _get_sectors(extractor: LanhuExtractor, project_id: str) -> dict:
             for img_id in image_ids:
                 image_sector_map[img_id] = name
 
-        return {'sectors': sectors, 'image_sector_map': image_sector_map}
-    except Exception:
-        return {'sectors': [], 'image_sector_map': {}}
+        return {
+            'status': 'success',
+            'sectors': sectors,
+            'image_sector_map': image_sector_map,
+        }
+    except Exception as exc:
+        return {
+            'status': 'error',
+            'message': f"Failed to get design sectors: {exc}",
+        }
 
 
-async def _get_designs_internal(extractor: LanhuExtractor, url: str) -> dict:
-    """内部函数：获取设计图列表"""
-    # 解析URL获取参数
-    params = extractor.parse_url(url)
-
+async def _fetch_designs_internal_network(extractor: LanhuExtractor, params: dict) -> dict:
+    """Fetch the project design index and sectors without using the cache."""
     # 并行获取设计图列表和分组信息
     import asyncio as _asyncio
     designs_task = _fetch_design_images(extractor, params)
@@ -4277,6 +4604,18 @@ async def _get_designs_internal(extractor: LanhuExtractor, url: str) -> dict:
     if designs_result.get('status') == 'error':
         return designs_result
 
+    if sectors_result.get('status') != 'success':
+        # Preserve the useful design list for this call, but never persist an
+        # index that is missing its sector data.
+        designs_result['sectors'] = []
+        designs_result['sector_status'] = 'error'
+        designs_result['sector_message'] = sectors_result.get(
+            'message',
+            'Failed to get design sectors',
+        )
+        designs_result['_cacheable'] = False
+        return designs_result
+
     # 将分组信息注入到每个设计图
     image_sector_map = sectors_result['image_sector_map']
     for design in designs_result['designs']:
@@ -4284,6 +4623,129 @@ async def _get_designs_internal(extractor: LanhuExtractor, url: str) -> dict:
 
     designs_result['sectors'] = sectors_result['sectors']
     return designs_result
+
+
+async def _get_cached_unversioned_json(
+    *,
+    namespace: str,
+    identity: dict,
+    cache_policy: str,
+    fetcher: Callable[[], Awaitable[dict]],
+) -> tuple[dict, dict]:
+    """Cache a TTL-bound endpoint that does not expose a stable version ID."""
+    policy = normalize_cache_policy(cache_policy)
+    request_started = datetime.now(timezone.utc).timestamp()
+    initial_record, initial_payload = DESIGN_CACHE.load_json(namespace, identity)
+
+    if policy == "bypass":
+        payload = await fetcher()
+        if isinstance(payload, dict) and '_cacheable' in payload:
+            payload = copy.deepcopy(payload)
+            payload.pop('_cacheable', None)
+        return payload, _build_cache_status(
+            state="bypass",
+            source="network",
+            cache_policy=policy,
+            remote_checked=True,
+        )
+
+    if (
+        policy == "use"
+        and initial_record
+        and initial_payload
+        and initial_record.is_fresh(DESIGN_CACHE_TTL_SECONDS)
+    ):
+        return initial_payload, _build_cache_status(
+            state="hit",
+            source="disk",
+            cache_policy=policy,
+            record=initial_record,
+        )
+
+    initial_checked_at = initial_record.checked_at if initial_record else float("-inf")
+    async with DESIGN_CACHE.lock(namespace, identity) as lock_stats:
+        current_record, current_payload = DESIGN_CACHE.load_json(namespace, identity)
+        if current_record and current_payload:
+            if policy == "use" and current_record.is_fresh(DESIGN_CACHE_TTL_SECONDS):
+                return current_payload, _build_cache_status(
+                    state="hit",
+                    source="disk",
+                    cache_policy=policy,
+                    record=current_record,
+                    lock_stats=lock_stats,
+                )
+            if (
+                lock_stats.waited_for_inflight
+                and current_record.checked_at > initial_checked_at
+                and current_record.checked_at >= request_started
+            ):
+                return current_payload, _build_cache_status(
+                    state="hit",
+                    source="disk",
+                    cache_policy=policy,
+                    record=current_record,
+                    lock_stats=lock_stats,
+                )
+
+        payload = await fetcher()
+        cacheable = True
+        if isinstance(payload, dict) and '_cacheable' in payload:
+            payload = copy.deepcopy(payload)
+            cacheable = bool(payload.pop('_cacheable'))
+        if isinstance(payload, dict) and payload.get('status') == 'error':
+            return payload, _build_cache_status(
+                state="miss",
+                source="network",
+                cache_policy=policy,
+                remote_checked=True,
+                lock_stats=lock_stats,
+            )
+        if not cacheable:
+            return payload, _build_cache_status(
+                state="miss",
+                source="network",
+                cache_policy=policy,
+                remote_checked=True,
+                lock_stats=lock_stats,
+            )
+        stored_record = DESIGN_CACHE.store_json(
+            namespace,
+            identity,
+            payload,
+            version_id=None,
+            metadata=identity,
+        )
+        return payload, _build_cache_status(
+            state="updated" if current_record else "miss",
+            source="network",
+            cache_policy=policy,
+            record=stored_record,
+            remote_checked=True,
+            lock_stats=lock_stats,
+        )
+
+
+async def _get_designs_internal(
+    extractor: LanhuExtractor,
+    url: str,
+    cache_policy: str = "use",
+) -> dict:
+    """Get the project design index through the persistent process-safe cache."""
+    params = extractor.parse_url(url)
+    identity = {
+        "cache_scope": DESIGN_CACHE_SCOPE,
+        "team_id": str(params['team_id']),
+        "project_id": str(params['project_id']),
+    }
+    result, cache_status = await _get_cached_unversioned_json(
+        namespace="design_index",
+        identity=identity,
+        cache_policy=cache_policy,
+        fetcher=lambda: _fetch_designs_internal_network(extractor, params),
+    )
+    result = copy.deepcopy(result)
+    result['cache'] = cache_status
+    return result
 
 
 async def _fetch_design_images(extractor: LanhuExtractor, params: dict) -> dict:
@@ -4341,12 +4803,189 @@ async def _fetch_design_images(extractor: LanhuExtractor, params: dict) -> dict:
     }
 
 
-def _safe_design_filename(design_name: str, image_id: str) -> str:
-    """为设计图保存生成稳定文件名，避免重名覆盖。"""
+def _safe_design_name_prefix(design_name: str, max_length: int = 32) -> str:
+    """Return a bounded readable filename prefix for Windows paths."""
     safe_name = re.sub(r'[^\w\s-]', '_', design_name or 'design').strip() or 'design'
     safe_name = re.sub(r'\s+', '_', safe_name)
-    short_id = str(image_id)[:8]
-    return f"{safe_name}__{short_id}.png"
+    return safe_name[:max_length].rstrip(' ._-') or 'design'
+
+
+def _safe_design_filename(design_name: str, image_id: str) -> str:
+    """Build a bounded stable filename without truncating the identity."""
+    prefix = _safe_design_name_prefix(design_name)
+    identity_digest = hashlib.sha256(str(image_id).encode("utf-8")).hexdigest()
+    return f"{prefix}__{identity_digest}.png"
+
+
+def _safe_versioned_design_filename(design_name: str, image_id: str, version_id: str) -> str:
+    """Generate an immutable screenshot filename for one exact design version."""
+    prefix = _safe_design_name_prefix(design_name)
+    identity = json.dumps(
+        [str(image_id), str(version_id)],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    identity_digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return f"{prefix}__{identity_digest}.png"
+
+
+def _has_supported_image_magic(content: bytes) -> bool:
+    """Recognize common raster image signatures without trusting HTTP headers."""
+    return (
+        content.startswith(b'\x89PNG\r\n\x1a\n')
+        or content.startswith(b'\xff\xd8\xff')
+        or content.startswith((b'GIF87a', b'GIF89a'))
+        or (
+            len(content) >= 12
+            and content.startswith(b'RIFF')
+            and content[8:12] == b'WEBP'
+        )
+        or content.startswith(b'BM')
+        or content.startswith((b'II*\x00', b'MM\x00*'))
+    )
+
+
+def _validate_design_screenshot_response(
+    extractor: LanhuExtractor,
+    response: httpx.Response,
+) -> bytes:
+    """Reject authentication/error bodies before they can enter the image cache."""
+    extractor._check_auth(response)
+    response.raise_for_status()
+
+    content = response.content
+    if not content:
+        raise Exception("Downloaded design screenshot is empty")
+
+    headers = getattr(response, 'headers', None)
+    declared_type = ''
+    if headers is not None:
+        declared_type = (headers.get('content-type') or '').split(';', 1)[0].strip().lower()
+    if declared_type and not (
+        declared_type.startswith('image/')
+        or declared_type == 'application/octet-stream'
+    ):
+        raise Exception(
+            f"Downloaded design screenshot has invalid Content-Type: {declared_type}"
+        )
+    if not _has_supported_image_magic(content):
+        raise Exception("Downloaded design screenshot has invalid image signature")
+    return content
+
+
+async def _get_design_screenshot_cached(
+    extractor: LanhuExtractor,
+    design: dict,
+    params: dict,
+    output_dir: Path,
+    cache_policy: str = "use",
+) -> dict:
+    """Resolve and cache one versioned design screenshot."""
+    policy = normalize_cache_policy(cache_policy)
+    image_id = str(design.get('image_id') or design.get('id'))
+    design_info, info_cache = await extractor.get_design_info_cached(
+        image_id=image_id,
+        team_id=params['team_id'],
+        project_id=params['project_id'],
+        cache_policy=policy,
+    )
+    remote_design = design_info['design']
+    latest_version = design_info['latest_version']
+    version_id = extractor._get_design_version_id(latest_version)
+    design_name = remote_design.get('name') or design.get('name') or 'design'
+    image_url = latest_version.get('url') or remote_design.get('url') or design.get('url')
+    if not image_url:
+        raise Exception("Design image URL not found")
+
+    filename = _safe_versioned_design_filename(design_name, image_id, version_id)
+    filepath = output_dir / filename
+    cache_identity = extractor._design_cache_identity(
+        image_id,
+        params['team_id'],
+        params['project_id'],
+    )
+    identity = {
+        **cache_identity,
+        'version_id': version_id,
+    }
+    namespace = "design_screenshot"
+
+    if policy == "bypass":
+        response = await extractor.client.get(image_url)
+        image_content = _validate_design_screenshot_response(extractor, response)
+        await asyncio.to_thread(DESIGN_CACHE.atomic_write_bytes, filepath, image_content)
+        screenshot_cache = _build_cache_status(
+            state="bypass",
+            source="network",
+            cache_policy=policy,
+            version_id=version_id,
+        )
+    else:
+        screenshot_record = DESIGN_CACHE.load_artifact(namespace, identity)
+        if screenshot_record:
+            filepath = screenshot_record.artifact_path
+            screenshot_cache = _build_cache_status(
+                state="hit",
+                source="disk",
+                cache_policy=policy,
+                record=screenshot_record,
+            )
+        else:
+            async with DESIGN_CACHE.lock(namespace, identity) as lock_stats:
+                screenshot_record = DESIGN_CACHE.load_artifact(namespace, identity)
+                if screenshot_record:
+                    filepath = screenshot_record.artifact_path
+                    screenshot_cache = _build_cache_status(
+                        state="hit",
+                        source="disk",
+                        cache_policy=policy,
+                        record=screenshot_record,
+                        lock_stats=lock_stats,
+                    )
+                else:
+                    response = await extractor.client.get(image_url)
+                    image_content = _validate_design_screenshot_response(extractor, response)
+                    await asyncio.to_thread(
+                        DESIGN_CACHE.atomic_write_bytes,
+                        filepath,
+                        image_content,
+                    )
+                    screenshot_record = await asyncio.to_thread(
+                        DESIGN_CACHE.store_artifact,
+                        namespace,
+                        identity,
+                        filepath,
+                        version_id=version_id,
+                        metadata={
+                            **cache_identity,
+                            'design_name': design_name,
+                        },
+                    )
+                    await asyncio.to_thread(
+                        DESIGN_CACHE.prune_versions,
+                        namespace,
+                        cache_identity,
+                    )
+                    screenshot_cache = _build_cache_status(
+                        state="updated" if info_cache.get('state') == 'updated' else "miss",
+                        source="network",
+                        cache_policy=policy,
+                        record=screenshot_record,
+                        previous_version_id=info_cache.get('previous_version_id'),
+                        lock_stats=lock_stats,
+                    )
+
+    return {
+        'success': True,
+        'design_name': design_name,
+        'image_id': image_id,
+        'version_id': version_id,
+        'screenshot_path': str(filepath),
+        'cache': {
+            'design_info': info_cache,
+            'screenshot': screenshot_cache,
+        },
+    }
 
 
 def _normalize_requested_image_ids(image_ids: Union[str, List[str]]) -> Union[str, List[str]]:
@@ -4382,11 +5021,66 @@ def _build_design_candidates(designs: List[dict]) -> List[dict]:
 async def _resolve_target_designs(
     extractor: LanhuExtractor,
     url: str,
-    image_ids: Union[str, List[str]]
+    image_ids: Union[str, List[str]],
+    cache_policy: str = "use",
 ) -> dict:
     """按 image_id 解析目标设计图，并统一处理候选与错误。"""
     params = extractor.parse_url(url)
-    designs_data = await _get_designs_internal(extractor, url)
+    normalized_image_ids = _normalize_requested_image_ids(image_ids)
+    embedded_image_id = str(params.get('doc_id')).strip() if params.get('doc_id') else None
+
+    if not normalized_image_ids:
+        return {
+            'status': 'error',
+            'message': 'image_id 不能为空',
+            'available_designs': []
+        }
+
+    if (
+        embedded_image_id
+        and normalized_image_ids != 'all'
+        and embedded_image_id not in normalized_image_ids
+    ):
+        return {
+            'status': 'error',
+            'message': f"URL 中的 image_id ({embedded_image_id}) 与请求参数不一致",
+            'available_designs': []
+        }
+
+    # Detail links already identify the exact board. Avoid fetching the entire
+    # project index before the version-aware detail request.
+    if embedded_image_id and normalized_image_ids == [embedded_image_id]:
+        target_design = {
+            'id': embedded_image_id,
+            'image_id': embedded_image_id,
+            'name': None,
+            'width': None,
+            'height': None,
+            'url': None,
+            'detail_direct': True,
+        }
+        return {
+            'status': 'success',
+            'params': params,
+            'designs_data': {
+                'status': 'success',
+                'project_name': params['project_id'],
+                'total_designs': 1,
+                'designs': [target_design],
+                'sectors': [],
+                'cache': {
+                    'state': 'skipped',
+                    'reason': 'detail_image_id_fast_path',
+                },
+            },
+            'target_designs': [target_design],
+        }
+
+    designs_data = await _get_designs_internal(
+        extractor,
+        url,
+        cache_policy=cache_policy,
+    )
 
     if designs_data.get('status') != 'success':
         return {
@@ -4397,8 +5091,6 @@ async def _resolve_target_designs(
 
     designs = designs_data.get('designs', [])
     available_designs = _build_design_candidates(designs)
-    normalized_image_ids = _normalize_requested_image_ids(image_ids)
-    embedded_image_id = str(params.get('doc_id')).strip() if params.get('doc_id') else None
 
     if normalized_image_ids == 'all':
         return {
@@ -4406,20 +5098,6 @@ async def _resolve_target_designs(
             'params': params,
             'designs_data': designs_data,
             'target_designs': designs
-        }
-
-    if not normalized_image_ids:
-        return {
-            'status': 'error',
-            'message': 'image_id 不能为空',
-            'available_designs': available_designs
-        }
-
-    if embedded_image_id and embedded_image_id not in normalized_image_ids:
-        return {
-            'status': 'error',
-            'message': f"URL 中的 image_id ({embedded_image_id}) 与请求参数不一致",
-            'available_designs': available_designs
         }
 
     design_map = {}
@@ -4448,6 +5126,7 @@ async def _resolve_target_designs(
 @mcp.tool()
 async def lanhu_get_designs(
     url: Annotated[str, "Lanhu URL WITHOUT docId (indicates UI design project, not PRD). Example: https://lanhuapp.com/web/#/item/project/stage?tid=xxx&pid=xxx. Required params: tid, pid (NO docId)"],
+    cache_policy: Annotated[CachePolicy, "Cache policy: use (default), refresh version/index now, or bypass cache"] = "use",
     ctx: Context = None
 ) -> dict:
     """
@@ -4471,7 +5150,7 @@ async def lanhu_get_designs(
             store = MessageStore(project_id)
             store.record_collaborator(user_name, user_role)
         
-        result = await _get_designs_internal(extractor, url)
+        result = await _get_designs_internal(extractor, url, cache_policy=cache_policy)
         
         # Add AI suggestion when there are many designs (>8)
         if result['status'] == 'success':
@@ -4493,6 +5172,7 @@ async def lanhu_get_designs(
 async def lanhu_get_ai_analyze_design_result(
         url: Annotated[str, "Lanhu URL WITHOUT docId (indicates UI design project). Example: https://lanhuapp.com/web/#/item/project/stage?tid=xxx&pid=xxx"],
         image_ids: Annotated[Union[str, List[str]], "Design image_id(s) to analyze. Use 'all' for all designs, single id like '123456', or list like ['123456', '789012']. Get exact image_id from lanhu_get_designs first!"],
+        cache_policy: Annotated[CachePolicy, "Cache policy: use (default), refresh version now, or bypass cache"] = "use",
         ctx: Context = None
 ) -> List[Union[str, Image]]:
     """
@@ -4516,7 +5196,12 @@ async def lanhu_get_ai_analyze_design_result(
             store = MessageStore(project_id)
             store.record_collaborator(user_name, user_role)
         
-        resolved = await _resolve_target_designs(extractor, url, image_ids)
+        resolved = await _resolve_target_designs(
+            extractor,
+            url,
+            image_ids,
+            cache_policy=cache_policy,
+        )
         if resolved['status'] != 'success':
             available_lines = [
                 f"  • {item['name']} (image_id={item['image_id']})"
@@ -4539,30 +5224,17 @@ async def lanhu_get_ai_analyze_design_result(
         results = []
         for design in target_designs:
             try:
-                # 获取原图URL（去掉OSS处理参数）
-                img_url = design['url'].split('?')[0]
-
-                # 下载图片
-                response = await extractor.client.get(img_url)
-                response.raise_for_status()
-
-                # 保存文件
-                filename = _safe_design_filename(design['name'], design['image_id'])
-                filepath = output_dir / filename
-
-                with open(filepath, 'wb') as f:
-                    f.write(response.content)
-
-                results.append({
-                    'success': True,
-                    'design_name': design['name'],
-                    'image_id': design['image_id'],
-                    'screenshot_path': str(filepath)
-                })
+                results.append(await _get_design_screenshot_cached(
+                    extractor,
+                    design,
+                    params,
+                    output_dir,
+                    cache_policy=cache_policy,
+                ))
             except Exception as e:
                 results.append({
                     'success': False,
-                    'design_name': design['name'],
+                    'design_name': design.get('name') or 'design',
                     'image_id': design.get('image_id'),
                     'error': str(e)
                 })
@@ -4580,6 +5252,13 @@ async def lanhu_get_ai_analyze_design_result(
         success_results = [r for r in results if r['success']]
         for idx, r in enumerate(success_results, 1):
             summary_text += f"{idx}. {r['design_name']} (image_id={r['image_id']})\n"
+            summary_text += f"   version_id={r['version_id']}\n"
+            summary_text += (
+                "   cache: "
+                f"design_info={r['cache']['design_info']['state']}, "
+                f"screenshot={r['cache']['screenshot']['state']}, "
+                f"waited={r['cache']['design_info']['waited_for_inflight'] or r['cache']['screenshot']['waited_for_inflight']}\n"
+            )
 
         # Show failed designs
         failed_results = [r for r in results if not r['success']]
@@ -4790,6 +5469,7 @@ async def lanhu_search_designs(
 async def lanhu_get_design_annotations(
         url: Annotated[str, "Lanhu URL for design project or a board URL with image_id. Example: https://lanhuapp.com/web/#/item/project/stage?tid=xxx&pid=xxx or https://lanhuapp.com/web/#/item/project/stage?tid=xxx&pid=xxx&image_id=123456"],
         image_id: Annotated[str, "Exact design image_id. Must match the image_id returned by lanhu_get_designs."],
+        cache_policy: Annotated[CachePolicy, "Cache policy: use (default), refresh version now, or bypass cache"] = "use",
         ctx: Context = None
 ) -> dict:
     """
@@ -4814,7 +5494,12 @@ async def lanhu_get_design_annotations(
             store = MessageStore(project_id)
             store.record_collaborator(user_name, user_role)
 
-        resolved = await _resolve_target_designs(extractor, url, image_id)
+        resolved = await _resolve_target_designs(
+            extractor,
+            url,
+            image_id,
+            cache_policy=cache_policy,
+        )
         if resolved['status'] != 'success':
             return resolved
 
@@ -4823,7 +5508,8 @@ async def lanhu_get_design_annotations(
         annotations = await extractor.get_design_annotations_info(
             image_id=target_design['image_id'],
             team_id=params['team_id'],
-            project_id=params['project_id']
+            project_id=params['project_id'],
+            cache_policy=cache_policy,
         )
         annotations['requested_image_id'] = str(image_id)
         return annotations
@@ -4841,6 +5527,7 @@ async def lanhu_get_design_slices(
         url: Annotated[str, "Lanhu URL WITHOUT docId (indicates UI design project). Example: https://lanhuapp.com/web/#/item/project/stage?tid=xxx&pid=xxx"],
         image_id: Annotated[str, "Exact design image_id (single board only, NOT 'all'). Example: '123456'. Must match the image_id from lanhu_get_designs."],
         include_metadata: Annotated[bool, "Include color, opacity, shadow info"] = True,
+        cache_policy: Annotated[CachePolicy, "Cache policy: use (default), refresh version now, or bypass cache"] = "use",
         ctx: Context = None
 ) -> dict:
     """
@@ -4864,7 +5551,12 @@ async def lanhu_get_design_slices(
             store = MessageStore(project_id)
             store.record_collaborator(user_name, user_role)
         
-        resolved = await _resolve_target_designs(extractor, url, image_id)
+        resolved = await _resolve_target_designs(
+            extractor,
+            url,
+            image_id,
+            cache_policy=cache_policy,
+        )
         if resolved['status'] != 'success':
             return resolved
 
@@ -4875,7 +5567,8 @@ async def lanhu_get_design_slices(
             image_id=target_design['image_id'],
             team_id=params['team_id'],
             project_id=params['project_id'],
-            include_metadata=include_metadata
+            include_metadata=include_metadata,
+            cache_policy=cache_policy,
         )
 
         # 5. Add AI workflow guide
