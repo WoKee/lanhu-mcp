@@ -1,0 +1,10 @@
+policy:
+  allow_implicit_invocation: false
+interface:
+  display_name: "Lanhu → Android XML (Auto)"
+  short_description: "Lanhu → auto-approved Android XML with mandatory AI Preview"
+dependencies:
+  tools:
+    - type: mcp
+      value: lanhu
+      description: "Lanhu design annotations, screenshots, slices, and AI analysis data"
