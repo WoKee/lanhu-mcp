@@ -179,16 +179,17 @@ args = ["/c", "C:\\绝对路径\\lanhu-mcp\\run_lanhu_mcp_stdio.bat"]
 
 ## 🧩 安装 Skill（可选，推荐）
 
-项目内置 8 个平台的 Skill 文件，配合 MCP 可让 AI 直接从蓝湖设计稿生成 UI 代码。
+项目内置 8 个平台、9 个 Skill 文件，配合 MCP 可让 AI 直接从蓝湖设计稿生成 UI 代码；Android XML 提供标准确认流程和自动 AI 验收两种模式。
 
-**不需要全部安装，只安装你用得到的平台即可。** 请询问用户需要哪些平台，然后只安装对应的 Skill。
+**不需要全部安装，只安装你用得到的平台或模式即可。** 请询问用户需要哪些平台/模式，然后只安装对应的 Skill。
 
-### 可选平台
+### 可选平台/模式
 
-| Skill 名称 | 平台 | 安装命令（Claude Code） |
+| Skill 名称 | 平台/模式 | 安装命令（Claude Code） |
 |------------|------|------------------------|
 | `lanhu-compose-plan` | Jetpack Compose | `cp -r skills/lanhu-compose-plan ~/.claude/skills/` |
-| `lanhu-xml-plan` | Android XML | `cp -r skills/lanhu-xml-plan ~/.claude/skills/` |
+| `lanhu-xml-plan` | Android XML（标准确认流程） | `cp -r skills/lanhu-xml-plan ~/.claude/skills/` |
+| `lanhu-xml-plan-allowed` | Android XML（自动批准、强制 AI 验收） | `cp -r skills/lanhu-xml-plan-allowed ~/.claude/skills/` |
 | `lanhu-flutter-plan` | Flutter | `cp -r skills/lanhu-flutter-plan ~/.claude/skills/` |
 | `lanhu-rn-plan` | React Native | `cp -r skills/lanhu-rn-plan ~/.claude/skills/` |
 | `lanhu-swiftui-plan` | SwiftUI | `cp -r skills/lanhu-swiftui-plan ~/.claude/skills/` |
@@ -202,18 +203,19 @@ args = ["/c", "C:\\绝对路径\\lanhu-mcp\\run_lanhu_mcp_stdio.bat"]
 
 ```
 Skill 文件可以让我直接从蓝湖设计稿生成对应平台的 UI 代码。
-目前支持以下平台，你需要安装哪些？（可多选，只装用得到的就行）
+目前支持以下平台/模式，你需要安装哪些？（可多选，只装用得到的就行；Android XML 两个模式通常二选一）
 
 1. Jetpack Compose（Android）
-2. Android XML
-3. Flutter
-4. React Native
-5. SwiftUI（iOS）
-6. Vue 3
-7. HTML + CSS
-8. uni-app
+2. Android XML（标准确认流程）
+3. Android XML（自动批准、强制 AI 验收）
+4. Flutter
+5. React Native
+6. SwiftUI（iOS）
+7. Vue 3
+8. HTML + CSS
+9. uni-app
 
-请告诉我编号，例如 "1, 3" 表示安装 Compose 和 Flutter。
+请告诉我编号，例如 "1, 4" 表示安装 Compose 和 Flutter。
 ```
 
 根据用户选择，只复制对应的 Skill 目录。
@@ -224,16 +226,23 @@ Skill 文件可以让我直接从蓝湖设计稿生成对应平台的 UI 代码�
 /lanhu-compose-plan https://lanhuapp.com/web/#/item/project/detailDetach?...&image_id=xxx
 ```
 
+Android XML 自动批准模式：
+
+```
+/lanhu-xml-plan-allowed https://lanhuapp.com/web/#/item/project/detailDetach?...&image_id=xxx
+```
+
 ### 其他客户端
 
 参考对应客户端的 Skill/Plugin 配置方式，将 `skills/` 目录下对应平台的 `SKILL.md` 文件导入即可。
 
-### 可用的 Skill
+### 可用的 Skill（9 个）
 
 | Skill 名称 | 输出平台 |
 |------------|----------|
 | `lanhu-compose-plan` | Jetpack Compose |
-| `lanhu-xml-plan` | Android XML |
+| `lanhu-xml-plan` | Android XML（标准确认流程） |
+| `lanhu-xml-plan-allowed` | Android XML（自动批准、强制 AI 验收） |
 | `lanhu-flutter-plan` | Flutter |
 | `lanhu-rn-plan` | React Native |
 | `lanhu-swiftui-plan` | SwiftUI |

@@ -106,12 +106,13 @@ args = ["/c", "C:\\path\\to\\lanhu-mcp\\run_lanhu_mcp_stdio.bat"]
 - 指定页面行为：`这是一个底部弹窗，不是整屏页面`
 - 数据对接：`列表数据从 ViewModel 获取，这里只写 UI`
 
-不同平台使用对应的 Skill 名称：
+不同平台/模式使用对应的 Skill 名称：
 
-| 命令 | 平台 |
+| 命令 | 平台/模式 |
 |------|------|
 | `/lanhu-compose-plan` | Jetpack Compose |
-| `/lanhu-xml-plan` | Android XML |
+| `/lanhu-xml-plan` | Android XML（标准确认流程） |
+| `/lanhu-xml-plan-allowed` | Android XML（自动批准、强制 AI 验收） |
 | `/lanhu-flutter-plan` | Flutter |
 | `/lanhu-rn-plan` | React Native |
 | `/lanhu-swiftui-plan` | SwiftUI |
@@ -137,7 +138,7 @@ args = ["/c", "C:\\path\\to\\lanhu-mcp\\run_lanhu_mcp_stdio.bat"]
 | **布局分析** | 兄弟间距、布局方向检测、层级树、最近邻关系 |
 | **设计图分组与搜索** | 按分组查看、按关键词搜索设计图 |
 | **服务版本自检** | 调用 `lanhu_get_server_info` 查询 MCP 版本、提交号和缓存能力 |
-| **Skill 代码生成（8 平台）** | 配合 annotations 数据，约束 AI 生成高还原度 UI 代码 |
+| **Skill 代码生成（8 平台，9 个 Skill）** | 配合 annotations 数据，约束 AI 生成高还原度 UI 代码 |
 
 ---
 
@@ -173,16 +174,17 @@ args = ["/c", "C:\\path\\to\\lanhu-mcp\\run_lanhu_mcp_stdio.bat"]
 
 ---
 
-## 🧩 Skill 文件（8 个平台）
+## 🧩 Skill 文件（8 个平台，9 个 Skill）
 
-内置 8 个平台的 Skill 文件（位于 `skills/` 目录），配合 `lanhu_get_design_annotations` 返回的标注数据，约束 AI 生成高还原度 UI 代码。
+内置 8 个平台、9 个 Skill 文件（位于 `skills/` 目录），配合 `lanhu_get_design_annotations` 返回的标注数据，约束 AI 生成高还原度 UI 代码；Android XML 提供标准确认流程和自动 AI 验收两种模式。
 
-### 支持的平台
+### 支持的平台/模式
 
 | Skill | 输出格式 |
 |-------|----------|
 | `lanhu-compose-plan` | Jetpack Compose |
-| `lanhu-xml-plan` | Android XML |
+| `lanhu-xml-plan` | Android XML（标准确认流程） |
+| `lanhu-xml-plan-allowed` | Android XML（自动批准、强制 AI 验收） |
 | `lanhu-flutter-plan` | Flutter Dart |
 | `lanhu-rn-plan` | React Native TSX |
 | `lanhu-swiftui-plan` | SwiftUI |
@@ -196,7 +198,7 @@ args = ["/c", "C:\\path\\to\\lanhu-mcp\\run_lanhu_mcp_stdio.bat"]
 
 **Claude Code：**
 ```bash
-cp -r skills/lanhu-*-plan ~/.claude/skills/
+cp -r skills/lanhu-*-plan* ~/.claude/skills/
 ```
 
 其他 AI 客户端参考对应的 Skill/Plugin 配置方式，将 `SKILL.md` 文件导入即可。
@@ -241,6 +243,7 @@ lanhu-mcp/
 ├── skills/                    # Skill 文件
 │   ├── lanhu-compose-plan/
 │   ├── lanhu-xml-plan/
+│   ├── lanhu-xml-plan-allowed/
 │   ├── lanhu-flutter-plan/
 │   ├── lanhu-rn-plan/
 │   ├── lanhu-swiftui-plan/
