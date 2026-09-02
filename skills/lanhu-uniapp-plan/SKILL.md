@@ -55,21 +55,20 @@ description: 输入蓝湖设计图详情 URL（含 image_id），使用 lanhu MC
 
 ## MCP 工具可见性与有限恢复（主路径前置）
 
-任务工具目录与 MCP 服务传输状态是两个独立状态。按本 Skill 的 URL 路由和当前阶段计算 `required_tools` 与 `target_key`：
+任务工具目录与 MCP 服务传输状态是两个独立状态。按本 Skill 的 URL 路由和当前阶段计算 `required_tools` 与 `target_key`。当前阶段任一必需工具不可见，不等于服务未启动，也不得输出等待态、进入 schema fallback 或终止流程；必须在同一轮进入下述 STDIO 自动恢复：
 
 下面的 PRD/邀请路由只在该 Skill 现有输入校验和阶段契约已接受后生效；恢复分支不放宽 `image_id` 等输入硬要求，也不扩展输出流程。
 
-- 设计稿链路使用 `target_key=(url,image_id)`；`recovery_stage=stage1`（阶段 1）只需 `lanhu_get_ai_analyze_design_result`，`recovery_stage=stage2`（阶段 2）需 `lanhu_get_design_annotations`、`lanhu_get_design_slices`。结果缓存跨阶段按 `target_key` 复用，恢复挂起保存 `recovery_stage`、`current_stage_data_pending` 和已成功结果。
+- 设计稿链路使用 `target_key=(url,image_id)`；`recovery_stage=stage1`（阶段 1）只需 `lanhu_get_ai_analyze_design_result`，`recovery_stage=stage2`（阶段 2）需 `lanhu_get_design_annotations`、`lanhu_get_design_slices`。结果缓存跨阶段按 `target_key` 复用；自动恢复只处理当前 `recovery_stage` 尚未完成的 `required_tools`，不提前探测下一阶段工具。
 - PRD/原型链路使用 `target_key=(url,docId)`，按当前阶段实际未完成调用计算 `required_tools`，只探测当前阶段需要的 `lanhu_get_pages`、`lanhu_get_ai_analyze_page_result` 等工具，不把设计稿三项误当成必需项。
 - 邀请链路使用 `target_key=(invite_url,sid)`，先只恢复 `lanhu_resolve_invite_link`；解析得到 canonical URL 后，按新的 `docId/image_id` 和当前阶段重新计算 `required_tools`、`target_key` 与 `recovery_stage`。
 
-1. 该恢复分支只适用于当前 `recovery_stage` 的 `required_tools` 尚未完整时。目录缺失不重试：直接记录 `task_tool_catalog=unavailable`，建立临时 `mcp_recovery_pending`，保存 `recovery_stage`、`current_stage_data_pending`、已成功结果及 `target_key`，并输出 `MCP_TOOL_CATALOG_PENDING`。目录可见但原生调用在返回结构化 MCP `CallToolResult` 前发生 `initialize`、连接关闭、协议分帧/传输错误时，先在当前 Client 立即重试一次；仍失败才保留 `task_tool_catalog=available` 并建立/保留同一临时标记。上述两种情况均不等于 lanhu-mcp 未启动，也不触发 `web_schema_fallback`、几何猜测或终止流程；合法 `CallToolResult` 的鉴权/参数/业务错误，以及 envelope 合法但 payload 校验失败，按本 Skill 原有数据规则处理。用户明确回复“继续”或“重试”只触发当前恢复轮，优先于其他审批语义；更换 URL、`image_id`、`docId` 或邀请 `sid` 时废弃旧轮并重新计算。
-2. 仅当 `mcp_recovery_pending` 仍有效且收到明确“继续/重试”时，执行一次当前 `recovery_stage` 的目录重查并计入 `catalog_refresh`。若目录此前为 `unavailable` 且重查后已包含当前阶段全部尚未完成的 `required_tools`，记录 `task_tool_catalog=recovered_via_continue`；若目录此前为 `available`（仅发生传输错误），保留 `task_tool_catalog=available`。目录重查只更新目录字段，不据此提前写 `mcp_transport_status` 或 `mcp_access_mode`；随后立即从首个未完成调用使用原生工具并复用同键结果，待当前阶段所需 native 调用取得可解析的结构化 envelope（包括 `isError=true`）后，才记录 `mcp_transport_status=healthy`、`mcp_access_mode=native_task_tools` 并清除 pending，回到当前阶段。目录重查一旦计入，后续“继续”不得再次刷新；若刷新后 native 即时重试仍失败，不得再次建立 pending，直接进入尚未使用的 `stdio_probe`，无可用 launcher 时输出 `FAIL_FAST: MCP_RECOVERY_EXHAUSTED`。
-   - 目录重查发生即记录 `mcp_recovery_steps=catalog_refresh`；若重查后仍缺少当前阶段工具，不发起不可见的原生调用，直接进入步骤 3。STDIO 介入后将该字段更新为 `catalog_refresh_then_stdio_bridge`。
-3. 目录仍缺少当前阶段所需工具，或原生调用再次在结构化结果前传输失败，且能读取已配置的 STDIO 启动方式时，最多执行一次受控只读 `stdio_probe`：使用完全相同的 `command`、`args`、`cwd`、`env`（或已确认的 `run_lanhu_mcp_stdio` launcher），以分离参数依次发送 `initialize`、`notifications/initialized`、`tools/list`。不得猜路径、回显 Cookie/环境变量或调用写入工具；Windows 路径不得拼成未经转义的单字符串，STDOUT 只接受 MCP JSON-RPC 帧，诊断留在 STDERR。若 `catalog_refresh` 已计入，不得重新建立 pending 或刷新目录；探测 Client 与后续调用 Client 可以是两个短会话，但必须指向同一已配置的 server/launcher。
-4. 只有握手响应和 `tools/list` 均可解析且包含当前阶段尚未完成调用所需的 `required_tools` 才记 `stdio_probe=passed` 并同步记 `mcp_transport_status=healthy`；缺工具记 `stdio_probe=failed`、`mcp_transport_status=healthy` 并以 `reason=required_tool_missing` 结束恢复，协议/超时/进程退出记 `stdio_probe=failed`、`mcp_transport_status=unhealthy`。探测成功后立即用同一 launcher 发起当前阶段尚未完成的 `tools/call`，不等待下一次“继续”；若后续 `tools/call` 在结构化结果前传输失败，保留 `stdio_probe=passed`、覆盖 `mcp_transport_status=unhealthy`，在当前 Client 立即重试一次；重试若取得可解析的结构化 `CallToolResult`（包括 `isError=true`），立即恢复 `mcp_transport_status=healthy`，仍失败则按本轮预算 `FAIL_FAST`；`tools/list` 本身永远不算设计数据。
-5. 以 `(target_key,tool_name,canonical_args)` 为结果键复用已成功且仍有效的结果，只调用当前阶段缺失或明确失效项。解析到结构化 `CallToolResult`（包括 `isError=true`）即为该项取得 envelope；当前阶段所需 envelope 全部到齐后，立即记录 `mcp_transport_status=healthy`、清除 `mcp_recovery_pending` 并回到当前阶段，合法 envelope 的接口错误或 payload 问题仍按本 Skill 原有规则处理，不把它们当作传输失败。只要本轮至少有一项调用经 STDIO 补齐，就记录 `mcp_access_mode=stdio_recovery`、`mcp_recovery_steps=catalog_refresh_then_stdio_bridge`；否则在 native envelope 到齐后记录 `mcp_access_mode=native_task_tools`。恢复得到的结果直接并入当前阶段数据链，阶段推进不清除 `target_key` 缓存，也不得重复成功调用。
-6. 每个 `(target_key,recovery_stage)` 的恢复预算固定为：目录重查最多 1 次、STDIO 探测最多 1 次、补齐当前阶段未完成调用最多 1 轮；当前 Client/恢复轮内的瞬时传输错误只立即重试 1 次。阶段推进可开启下一阶段自己的恢复轮，但不清除同一 `target_key` 的结果缓存；`mcp_retry_count` 只按 `target_key` 累计额外的传输重试次数，不包含 `catalog_refresh`、`stdio_probe` 或结构化业务错误，重复“继续”不得重置计数。预算耗尽或无法启动/握手/发起恢复调用时输出 `FAIL_FAST: MCP_RECOVERY_EXHAUSTED` 及 `reason=native_call_transport_failed|stdio_transport_unhealthy|required_tool_missing|stdio_call_transport_failed|recovery_budget_exhausted` 并停止。仅目录暂缺、一次瞬时传输错误或 STDIO 探测成功但原生目录仍未注入，均不得触发 schema fallback。
+1. 该自动恢复分支只适用于当前 `recovery_stage` 的 `required_tools` 尚未完整时，并按 `(target_key,tool_name,canonical_args)` 复用已成功且仍有效的结果。若当前阶段全部尚未完成工具均可见，优先从首个未完成工具发起原生调用；直接取得可解析的结构化 MCP `CallToolResult`（包括 `isError=true`）时记录 `task_tool_catalog=available`、`mcp_transport_status=healthy`、`mcp_access_mode=native_task_tools`、`mcp_recovery_steps=none` 并回到当前阶段。调用在结构化结果前发生 `initialize`、连接关闭、协议分帧等传输错误时，在当前 Client 立即重试一次；重试成功时保持 `mcp_recovery_steps=none` 并通过 `mcp_retry_count` 记录额外调用，仍失败时保留 `task_tool_catalog=available` 并立即进入步骤 2。已经返回结构化 `CallToolResult` 的鉴权、参数、业务错误，以及 envelope 合法但 payload 校验失败，不属于传输恢复，按本 Skill 原有数据规则处理。
+2. 若当前阶段任一尚未完成工具不可见，或步骤 1 的原生即时重试仍失败，必须在同一轮进入本步骤。前者记录 `task_tool_catalog=unavailable` 且不得发起不可见的原生调用；后者保留 `task_tool_catalog=available`。两种入口均不得建立需要用户消息解除的 pending 状态，不得输出 `MCP_TOOL_CATALOG_PENDING`，也不得要求用户回复“继续”或“重试”。使用当前已配置 STDIO 启动方式最多执行一次受控只读 `stdio_probe`：使用完全相同的 `command`、`args`、`cwd`、`env`（或已确认的 `run_lanhu_mcp_stdio` launcher），以分离参数依次发送 `initialize`、`notifications/initialized`、`tools/list`。不得猜路径、回显 Cookie/环境变量或调用写入工具；Windows 路径不得拼成未经转义的单字符串，STDOUT 只接受 MCP JSON-RPC 帧，诊断留在 STDERR。探测 Client 与后续调用 Client 可以是两个短会话，但必须指向同一已配置的 server/launcher。
+3. 只有握手响应和 `tools/list` 均可解析，且列表包含当前阶段尚未完成调用所需的 `required_tools` 时，才记录 `stdio_probe=passed`、`mcp_transport_status=healthy`。握手成功但缺工具时记录 `stdio_probe=failed`、`mcp_transport_status=healthy`、`reason=required_tool_missing`；协议、分帧、超时或进程退出时记录 `stdio_probe=failed`、`mcp_transport_status=unhealthy`。探测成功后立即用同一 launcher 发起当前阶段尚未完成的 `tools/call`，不得暂停或等待新的用户消息；`tools/list` 永远不算设计数据。
+4. STDIO `tools/call` 在结构化结果前发生传输错误时，保留 `stdio_probe=passed`、覆盖 `mcp_transport_status=unhealthy`，在当前 Client 立即重试一次；重试取得可解析的结构化 `CallToolResult`（包括 `isError=true`）时立即恢复 `mcp_transport_status=healthy`，仍失败则按本轮预算结束恢复。
+5. 只调用当前阶段缺失或明确失效项。解析到结构化 `CallToolResult`（包括 `isError=true`）即为该项取得 envelope；当前阶段所需 envelope 全部到齐后结束自动恢复并回到当前阶段。只要本轮至少一项由 STDIO 补齐，就记录 `mcp_access_mode=stdio_recovery`、`mcp_recovery_steps=stdio_bridge`；此前是否发生原生即时重试由 `mcp_retry_count` 和 `mcp_calls` 表达。未使用 STDIO 时记录 `mcp_access_mode=native_task_tools`、`mcp_recovery_steps=none`。合法 envelope 的接口错误或 payload 问题仍按本 Skill 原有规则处理，不把它们当作传输失败；恢复结果直接并入当前阶段数据链，阶段推进不清除 `target_key` 缓存，也不得重复成功调用。
+6. 每个 `(target_key,recovery_stage)` 的自动恢复预算固定为：STDIO 探测最多 1 次、补齐当前阶段未完成调用最多 1 轮；当前 Client/恢复轮内的瞬时传输错误只立即重试 1 次。阶段推进可开启下一阶段自己的恢复轮，但不清除同一 `target_key` 的结果缓存；不得通过暂停、要求用户回复或重新进入同一 `recovery_stage` 来重置预算。`mcp_retry_count` 只按 `target_key` 累计额外的传输重试次数，不包含 `stdio_probe` 或结构化业务错误；`mcp_calls` 逐项记录工具、方式、参数键、阶段、顺序、尝试次数和 `reused|success|error`。预算耗尽或无法启动、握手、列出所需工具或发起恢复调用时，输出 `FAIL_FAST: MCP_RECOVERY_EXHAUSTED` 及 `reason=native_call_transport_failed|stdio_transport_unhealthy|required_tool_missing|stdio_call_transport_failed|recovery_budget_exhausted` 并停止。目录暂缺、一次瞬时传输错误或 STDIO 探测成功但原生目录仍未注入，均不得触发 schema fallback。
 
 ## URL 与工具路由（强制）
 
@@ -193,7 +192,7 @@ description: 输入蓝湖设计图详情 URL（含 image_id），使用 lanhu MC
    - `FAIL_FAST: SCHEMA_FETCH_FAILED`
 6. 进入兜底后 schema 解析失败：
    - `FAIL_FAST: SCHEMA_PARSE_FAILED`
-7. MCP 工具目录刷新与 STDIO 恢复预算耗尽：
+7. MCP 自动 STDIO 恢复预算耗尽：
    - `FAIL_FAST: MCP_RECOVERY_EXHAUSTED`
 
 默认一律硬失败，禁止静默降级为估算模式。
@@ -302,12 +301,12 @@ description: 输入蓝湖设计图详情 URL（含 image_id），使用 lanhu MC
 - `tool_route=design_chain|prd_chain`
 - `mcp_calls`
 - `recovery_stage=<当前阶段>`
-- `task_tool_catalog=available|recovered_via_continue|unavailable`
+- `task_tool_catalog=available|unavailable`
 - `stdio_probe=not_run|passed|failed`
 - `mcp_transport_status=healthy|unhealthy|not_probed`
 - `mcp_access_mode=native_task_tools|stdio_recovery`
-- `mcp_recovery_steps=none|catalog_refresh|catalog_refresh_then_stdio_bridge`
-- `mcp_retry_count=<非负整数，按 target_key 累计额外传输重试次数；不含 catalog_refresh、stdio_probe 或结构化业务错误>`
+- `mcp_recovery_steps=none|stdio_bridge`
+- `mcp_retry_count=<非负整数，按 target_key 累计额外传输重试次数；不含 stdio_probe 或结构化业务错误>`
 - `selection_key=image_id`
 - `selected_image_id`
 - `source_mode=mcp_annotations_primary|web_schema_fallback`
@@ -317,7 +316,7 @@ description: 输入蓝湖设计图详情 URL（含 image_id），使用 lanhu MC
 - `text_source_priority`
 - `data_source=text/icon/spacing=annotations|dds_schema`
 - `fallback_reason`（仅兜底时必填）
-原生目录直接可用且当前阶段未发生即时重试时记录 `task_tool_catalog=available`、`stdio_probe=not_run`、`mcp_transport_status=healthy`、`mcp_access_mode=native_task_tools`、`mcp_recovery_steps=none`。仅当同一 `target_key` 的 stage1/stage2 均未发生额外传输重试时，`mcp_retry_count=0`；当前阶段发生即时重试时，在跨阶段累计值上按实际额外次数增加。目录刷新只更新 `task_tool_catalog`：仅此前为 `unavailable` 且重查补齐时记录 `recovered_via_continue`，仅传输故障时保留 `available`；当前阶段的原生调用取得合法 envelope 后才记录 `mcp_transport_status=healthy`、`mcp_access_mode=native_task_tools`。“STDIO 恢复”只要本轮至少补齐一项且当前阶段所需 envelope 到齐就记录 `mcp_transport_status=healthy`、`mcp_access_mode=stdio_recovery`、`mcp_recovery_steps=catalog_refresh_then_stdio_bridge`；恢复挂起时只输出临时状态，不伪造完整 A) 审计字段。
+当前阶段原生工具直接可用时记录 `task_tool_catalog=available`、`stdio_probe=not_run`、`mcp_transport_status=healthy`、`mcp_access_mode=native_task_tools`、`mcp_recovery_steps=none`，并按实际额外传输重试次数填写跨阶段累计的 `mcp_retry_count`。目录缺失后由 STDIO 补齐时记录 `task_tool_catalog=unavailable`、`stdio_probe=passed`、`mcp_transport_status=healthy`、`mcp_access_mode=stdio_recovery`、`mcp_recovery_steps=stdio_bridge`；原生即时重试仍失败后由 STDIO 补齐时保留 `task_tool_catalog=available`，同样记录 `mcp_recovery_steps=stdio_bridge`，并通过 `mcp_retry_count`、`mcp_calls` 保留原生失败与重试轨迹。接口错误或 payload 问题仍按既定规则处理；已成功调用按结果键复用，不能再次拉取。自动恢复失败时只输出 `FAIL_FAST` 与原因，不伪造完整 A) 审计。
 
 ## 阶段 1（定位/选中/默认承载）
 进入本阶段时设置 `recovery_stage=stage1`。
@@ -354,7 +353,7 @@ description: 输入蓝湖设计图详情 URL（含 image_id），使用 lanhu MC
    - 间距优先使用 measurements，缺项时回退几何关系
    - 圆角优先读取 `annotations.style.border_radius`
 5. 仅当步骤 1~3 中相关 `tools/call` 已返回可解析的结构化 `CallToolResult`，且命中本节列出的接口错误或关键 payload 条件时，触发 `web_schema_fallback`；AI 分析若按既有规则可降级为 `EMPTY` 则不触发，否则仅按本节 AI 条件处理。
-   - 若目录缺失、仍处于 `mcp_recovery_pending` 或在结构化结果前传输失败，先按上述恢复分支处理，不触发 fallback。
+   - 若当前阶段任一所需工具不可见，或原生调用在结构化结果前传输失败，必须先在同一轮按上述自动恢复分支处理，不触发 fallback。
 6. 输出 A) 审计区（必须完整）
 7. 输出 B) 规格表（<=3 层组件树）
 8. 输出 C) uni-app 文件内容（仅 `.vue` + `pages.json` 片段）
