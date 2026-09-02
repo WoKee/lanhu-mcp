@@ -316,9 +316,11 @@ System insets should NOT be used to replace design-specified spacing. Only use s
 
 Preview 分支：
 
-- 选择 `AI验收`：`preview_choice_pending -> ai_preview_review -> block_preview_accepted -> next_block`
-- 选择 `跳过验收`：`preview_choice_pending|ai_preview_review -> block_preview_skipped -> next_block`
+- 选择 `AI验收`：`preview_choice_pending -> ai_preview_review -> block_preview_accepted -> next_block`（验收通过后自动衔接）
+- 选择 `跳过验收`：`preview_choice_pending|ai_preview_review -> block_preview_skipped -> next_block`（记录跳过后自动衔接）
 - 所有区块完成后：`next_block -> page_integration_pending -> page_integrated`
+
+- `next_block` 是自动过渡而不是等待状态：当前区块进入 `block_preview_accepted` 或 `block_preview_skipped` 后，若区块地图仍有未完成区块，必须在同一轮按已确认的 `implementation_order` 选择下一块并立即执行阶段 2，输出下一块的 `BLOCK_PLAN` 与确认提示；不得只报告当前区块验收结果、询问是否继续或等待用户再回复“继续”。该自动过渡只生成下一块方案并停在 `block_plan_pending`，不表示下一块方案已获批准，禁止自动进入阶段 3。若没有未完成区块，按阶段 4 的既有规则处理。
 
 MCP 恢复临时分支（不改变业务审批状态）：
 
@@ -414,7 +416,7 @@ MCP 恢复临时分支（不改变业务审批状态）：
 2. 只搜索当前区块需要的项目组件、宿主代码和资源；结合截图语义、annotations 与目标工程惯例形成关系拓扑。
 3. 必须先输出一幅简洁关系图，再输出当前区块规格；关系图需要清楚表达固定区、弹性区、等分区、公共列和主要锚点。
 4. 方案必须完成设计宽度、一个更窄宽度和一个更宽宽度的关系审计；这些测试 viewport 不得写入 XML 根节点。
-5. 只输出当前 `BLOCK_PLAN` 和一个确认提示；禁止输出 XML/Kotlin 或修改文件。
+5. 只输出当前 `BLOCK_PLAN` 和一个确认提示；仅在由阶段 3A/3B 的 `next_block` 自动过渡进入本阶段时，允许在其前面输出上一块规定的验收结论。禁止输出 XML/Kotlin 或修改文件。
 6. 输出后状态为 `block_plan_pending`。用户提出调整时，更新同一方案并继续保持该状态；不得因为已经修改过一次方案而自动实现。
 
 ### BLOCK_PLAN 强制字段
@@ -482,7 +484,7 @@ MCP 恢复临时分支（不改变业务审批状态）：
 4. 若差异只涉及已批准拓扑内的尺寸、颜色、文案、占位或资源引用，只修改当前区块并重新渲染；若需要改变容器、锚点、列模型、宽度角色或 GONE 行为，退回 `block_plan_pending` 并等待方案重新确认。
 5. AI 自动修正并重新渲染最多两轮；仍有差异时输出剩余问题，状态保持 `ai_preview_review`，询问用户补充调整意见、稍后重试或 `跳过验收`，禁止无限重试或扩大到其他区块。
 6. Preview 无法启动或截图不可读取时，不得声称验收通过，也不得为此运行全量构建；状态保持 `ai_preview_review`，说明阻塞，并重新询问用户选择稍后重试或 `跳过验收`。
-7. 通过时输出 `AI_PREVIEW_REVIEW: PASSED`、对比结论和已知未验收项，状态改为 `block_preview_accepted`；下一轮才进入下一块的阶段 2。
+7. 通过时输出 `AI_PREVIEW_REVIEW: PASSED`、对比结论和已知未验收项，状态改为 `block_preview_accepted`；若仍有未完成区块，必须在同一轮按 `next_block` 自动过渡规则进入下一块的阶段 2，不得等待用户回复“继续”。若没有未完成区块，按阶段 4 的既有规则处理。
 
 ## 阶段 3B：跳过 Preview 验收
 
@@ -490,7 +492,7 @@ MCP 恢复临时分支（不改变业务审批状态）：
 
 1. 不启动 Android Studio Preview，不捕获截图，不执行截图对比，也不追加为视觉验收而运行的命令。
 2. 输出 `PREVIEW_REVIEW: SKIPPED_BY_USER`，明确当前区块只完成了阶段 3 的定向静态检查、没有经过视觉验收；状态改为 `block_preview_skipped`。
-3. 下一轮进入下一块的阶段 2。用户之后若反馈当前区块问题，只调整该区块：涉及关系拓扑时退回阶段 2，仅实现细节时按已批准方案修正并重新询问验收方式。
+3. 若仍有未完成区块，必须在同一轮按 `next_block` 自动过渡规则进入下一块的阶段 2，不得等待用户回复“继续”；若没有未完成区块，按阶段 4 的既有规则处理。用户之后若反馈当前区块问题，只调整该区块：涉及关系拓扑时退回阶段 2，仅实现细节时按已批准方案修正并重新询问验收方式。
 
 ## 阶段 4：整页组合审计
 
