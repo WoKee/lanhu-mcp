@@ -2,7 +2,7 @@ policy:
   allow_implicit_invocation: false
 interface:
   display_name: "Lanhu → Android XML (Auto)"
-  short_description: "Lanhu → auto-approved Android XML with mandatory AI Preview"
+  short_description: "Auto-approved Android XML; AI Preview failures stay pending"
 dependencies:
   tools:
     - type: mcp

@@ -189,7 +189,7 @@ args = ["/c", "C:\\绝对路径\\lanhu-mcp\\run_lanhu_mcp_stdio.bat"]
 |------------|------|------------------------|
 | `lanhu-compose-plan` | Jetpack Compose | `cp -r skills/lanhu-compose-plan ~/.claude/skills/` |
 | `lanhu-xml-plan` | Android XML（标准确认流程） | `cp -r skills/lanhu-xml-plan ~/.claude/skills/` |
-| `lanhu-xml-plan-allowed` | Android XML（自动批准、强制 AI 验收） | `cp -r skills/lanhu-xml-plan-allowed ~/.claude/skills/` |
+| `lanhu-xml-plan-allowed` | Android XML（自动批准、强制发起 AI 验收；失败待验收并继续） | `cp -r skills/lanhu-xml-plan-allowed ~/.claude/skills/` |
 | `lanhu-flutter-plan` | Flutter | `cp -r skills/lanhu-flutter-plan ~/.claude/skills/` |
 | `lanhu-rn-plan` | React Native | `cp -r skills/lanhu-rn-plan ~/.claude/skills/` |
 | `lanhu-swiftui-plan` | SwiftUI | `cp -r skills/lanhu-swiftui-plan ~/.claude/skills/` |
@@ -207,7 +207,7 @@ Skill 文件可以让我直接从蓝湖设计稿生成对应平台的 UI 代码�
 
 1. Jetpack Compose（Android）
 2. Android XML（标准确认流程）
-3. Android XML（自动批准、强制 AI 验收）
+3. Android XML（自动批准、强制发起 AI 验收；失败待验收并继续）
 4. Flutter
 5. React Native
 6. SwiftUI（iOS）
@@ -242,7 +242,7 @@ Android XML 自动批准模式：
 |------------|----------|
 | `lanhu-compose-plan` | Jetpack Compose |
 | `lanhu-xml-plan` | Android XML（标准确认流程） |
-| `lanhu-xml-plan-allowed` | Android XML（自动批准、强制 AI 验收） |
+| `lanhu-xml-plan-allowed` | Android XML（自动批准、强制发起 AI 验收；失败待验收并继续） |
 | `lanhu-flutter-plan` | Flutter |
 | `lanhu-rn-plan` | React Native |
 | `lanhu-swiftui-plan` | SwiftUI |

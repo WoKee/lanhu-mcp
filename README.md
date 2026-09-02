@@ -112,7 +112,7 @@ args = ["/c", "C:\\path\\to\\lanhu-mcp\\run_lanhu_mcp_stdio.bat"]
 |------|------|
 | `/lanhu-compose-plan` | Jetpack Compose |
 | `/lanhu-xml-plan` | Android XML（标准确认流程） |
-| `/lanhu-xml-plan-allowed` | Android XML（自动批准、强制 AI 验收） |
+| `/lanhu-xml-plan-allowed` | Android XML（自动批准、强制发起 AI 验收；失败待验收并继续） |
 | `/lanhu-flutter-plan` | Flutter |
 | `/lanhu-rn-plan` | React Native |
 | `/lanhu-swiftui-plan` | SwiftUI |
@@ -184,7 +184,7 @@ args = ["/c", "C:\\path\\to\\lanhu-mcp\\run_lanhu_mcp_stdio.bat"]
 |-------|----------|
 | `lanhu-compose-plan` | Jetpack Compose |
 | `lanhu-xml-plan` | Android XML（标准确认流程） |
-| `lanhu-xml-plan-allowed` | Android XML（自动批准、强制 AI 验收） |
+| `lanhu-xml-plan-allowed` | Android XML（自动批准、强制发起 AI 验收；失败待验收并继续） |
 | `lanhu-flutter-plan` | Flutter Dart |
 | `lanhu-rn-plan` | React Native TSX |
 | `lanhu-swiftui-plan` | SwiftUI |

@@ -1,9 +1,9 @@
 ---
 name: lanhu-xml-plan-allowed
-description: 输入蓝湖设计图详情 URL（含 image_id），先通过 lanhu MCP 获取截图与 annotations(dp)，再按业务区块逐个规划并自动批准实现传统 Android XML；每个区块实现后自动执行 AI Preview 验收，不等待开发者确认；布局优先 ConstraintLayout，shape 样式优先复用项目 View.changeBg()。
+description: 输入蓝湖设计图详情 URL（含 image_id），先通过 lanhu MCP 获取截图与 annotations(dp)，再按业务区块逐个规划并自动批准实现传统 Android XML；每个区块实现后自动发起 AI Preview 验收，任何未得到 PASSED 的验收结果均记录为待验收并继续后续流程，不等待开发者确认；布局优先 ConstraintLayout，shape 样式优先复用项目 View.changeBg()。
 ---
 
-# 蓝湖 → Android XML（自动批准 + 强制 AI 验收）
+# 蓝湖 → Android XML（自动批准 + 强制发起 AI 验收）
 
 ## Skill 执行优先级（硬门禁）
 
@@ -295,21 +295,27 @@ System insets should NOT be used to replace design-specified spacing. Only use s
 
 默认状态顺序：
 
-`partition_pending -> partition_approved -> block_plan_pending -> block_plan_approved -> block_implemented -> ai_preview_review -> block_preview_accepted -> next_block`
+`partition_pending -> partition_approved -> block_plan_pending -> block_plan_approved -> block_implemented -> ai_preview_review -> block_preview_accepted|block_preview_pending -> next_block -> page_integration_pending -> page_integrated|page_integrated_preview_pending`
 
 Preview 流程：
 
 - 每个区块定向静态检查通过后自动进入 `ai_preview_review`，执行 AI Preview 验收；不提供开发者选择分支。
-- AI Preview 通过后：`ai_preview_review -> block_preview_accepted -> next_block`
-- 仍有未完成区块时：`next_block -> block_plan_pending`；所有区块完成后：`next_block -> page_integration_pending -> page_integrated`
+- AI Preview 只有输出精确的 `AI_PREVIEW_REVIEW: PASSED` 才能进入 `block_preview_accepted -> next_block`。
+- AI Preview 未得到 `PASSED` 时：输出 `AI_PREVIEW_REVIEW: PENDING`，记录 `block_id`、`pending_reason`、`remaining_preview_issues` 和 `pending_preview_blocks`，并执行 `ai_preview_review -> block_preview_pending -> next_block`；任何验收失败或无法完成均不得暂停、询问用户或标记为通过/跳过。
+- 仍有尚未实现区块时：`next_block -> block_plan_pending`；所有区块均已实现后：`next_block -> page_integration_pending`。无待验收区块时可进入 `page_integrated`；存在待验收区块时进入 `page_integrated_preview_pending`。
 
 - 区块地图和区块方案仍须分别生成、审计并记录状态，但批准动作自动完成，不暂停等待用户确认。
 - 用户在实现前明确提出调整时，回到对应状态重新生成并审计；没有调整时不因沉默而暂停。
 - 区块步骤不得省略；本变体只取消确认等待，不取消数据审计、关系拓扑分析或定向静态检查。
-- 每个区块实现后自动启动 Android Studio Preview、捕获截图并执行视觉对比；不得改为跳过验收。
-- 只有截图、宿主、资源或动态行为等关键证据缺失时，才按“补充信息暂停态”提出最小问题；这类问题不属于常规方案确认。
-- 自动重规划或重渲染最多两轮；仍无法成立时进入技术阻塞并报告原因，不得无限循环或标记为已验收。
+- 每个区块实现后自动尝试启动 Android Studio Preview、捕获截图并执行视觉对比；不得主动改为跳过验收。进入 `ai_preview_review` 后，任何未得到 `PASSED` 的结果均按 `block_preview_pending` 非阻塞流转。
+- 只有设计原图、宿主、资源或动态行为等验收前关键证据缺失时，才按“补充信息暂停态”提出最小问题；这类问题不属于常规方案确认。AI Preview 阶段的任何失败不属于补充信息暂停条件。
+- 在进入 `ai_preview_review` 之前，阶段 2/3 的方案或实现自动重规划最多两轮；仍无法形成可实施且定向静态检查通过的版本时进入技术阻塞。进入 `ai_preview_review` 后，阶段 3A 的自动修正、重渲染及由视觉差异触发的重规划最多两轮；仍未得到 `PASSED` 时必须记为待验收并继续，不得进入技术阻塞或无限循环。
 - MCP 数据默认只获取一次并在同一任务中复用；除非数据缺失、失效或用户更换画板，不得每个区块重复拉取
+
+待验收回流：
+
+- 后续具备重试条件时，按实现顺序执行 `block_preview_pending -> ai_preview_review`；只有精确输出 `PASSED` 才改为 `block_preview_accepted` 并从 `pending_preview_blocks` 移除对应 `block_id`；再次非 `PASSED` 时按阶段 3A 第 6 条更新待验收记录，继续保留该 `block_id` 并推进后续流程，不暂停或询问。
+- 若补验只完成视觉核对且未修改文件，全部待验收区块通过后可将 `page_integrated_preview_pending` 改为 `page_integrated`。若补验导致文件修正，必须先重跑该区块定向静态检查及阶段 4 整页组合审计，全部通过后才能改为 `page_integrated`。
 
 ## 阶段 1：数据获取与业务区块地图
 
@@ -352,6 +358,7 @@ Preview 流程：
 - `shape_mode=changeBg_primary`
 - `preview_mode=tools_attributes`
 - `preview_acceptance_mode=auto_ai_each_block`
+- `preview_non_passed_failure_mode=pending_continue`
 - `asset_resolution=project_reuse_first`
 - `slice_download=deferred|approved|not_required`
 - `confirmation_mode=none_auto_approve`
@@ -376,7 +383,7 @@ Preview 流程：
 
 前置：区块地图已完成审计并自动标记为 `partition_approved`。
 
-1. 每次只选择一个 `block_id`；默认按已确定的 `implementation_order` 选择首个未完成区块，用户可在开始前指定顺序。
+1. 每次只选择一个 `block_id`；默认按已确定的 `implementation_order` 选择首个尚未实现的区块，用户可在开始前指定顺序。`block_preview_pending` 表示实现已完成，只加入 `pending_preview_blocks`，不得被重新选作待实现区块。
 2. 只搜索当前区块需要的项目组件、宿主代码和资源；结合截图语义、annotations 与目标工程惯例形成关系拓扑。
 3. 必须先输出一幅简洁关系图，再输出当前区块规格；关系图需要清楚表达固定区、弹性区、等分区、公共列和主要锚点。
 4. 方案必须完成设计宽度、一个更窄宽度和一个更宽宽度的关系审计；这些测试 viewport 不得写入 XML 根节点。
@@ -429,42 +436,45 @@ Preview 流程：
 前置：当前区块方案已通过完整审计并自动标记为 `block_plan_approved`。
 
 1. XML Agent 只能消费已自动批准方案；不得重新决定容器、公共列、固定/弹性角色、文本策略或显隐行为。
-2. 若实施时发现方案无法成立，立即退回 `block_plan_pending` 并重新生成、审计和自动批准方案，最多自动重规划两轮；若仍无法成立，进入“补充信息暂停态”并报告原因。若缺少宿主或产生新依赖，只提出继续所需的最小问题，禁止边实现边自行改变拓扑。
+2. 若在进入 `ai_preview_review` 前实施时发现方案无法成立，立即退回 `block_plan_pending` 并重新生成、审计和自动批准方案，最多自动重规划两轮；若仍无法成立，进入“补充信息暂停态”并报告原因。若缺少宿主或产生新依赖，只提出继续所需的最小问题，禁止边实现边自行改变拓扑。进入 `ai_preview_review` 后不得以本条阻塞后续区块。
 3. 按用户原始授权写入目标工程，或在只读请求中只输出当前区块代码。首次实现可建立已规划的最小页面 shell，但不得预填、猜测或顺带实现未批准区块。
 4. 已实现区块仅允许本轮当前区块范围内的修改；禁止为了方便重构其他已批准或未批准区块。
 5. Kotlin 只允许在已定位宿主中，通过现有 ViewBinding/DataBinding 等方式调用 `View.changeBg()` 设置样式；禁止动态创建 View、`findViewById` 或 `addView`。
 6. 为当前区块的动态文本、动态图片、延后切图和运行时 `changeBg()` 补充必要 `tools:*`，但遵守根 Preview 尺寸禁令。
 7. 只做当前区块的 XML 解析、资源/ID/同父约束、文本策略、baseline 例外、字体映射与 Data Binding 语法、内部容器必要性、居中边距冗余、宽度扰动和 GONE 状态定向检查；除非用户明确要求，不运行全量构建。所有定向静态检查必须通过后才能进入 `ai_preview_review`；检查失败时先在已批准方案内修正并重跑，若失败说明方案拓扑不成立则退回 `block_plan_pending`，重新生成并自动审计方案。
 8. 定向静态检查全部通过后，输出 `BLOCK_IMPLEMENTED`、变更文件和检查结果，并自动启动当前区块的 Android Studio Preview 与蓝湖截图视觉对比，状态记为 `ai_preview_review`。
-9. 不等待用户选择验收方式；每个区块都必须执行 AI Preview 验收。
+9. 不等待用户选择验收方式；每个区块都必须发起 AI Preview 验收。任何未得到 `PASSED` 的结果都按 `block_preview_pending` 分支继续，不把“已尝试”或“验收失败”写成“已验收”。
 
-## 阶段 3A：强制 AI Preview 验收
+## 阶段 3A：强制发起 AI Preview 验收
 
 前置：当前区块已实现、定向静态检查通过且自动进入 `ai_preview_review`。
 
 1. 仅渲染和检查当前区块；使用 Android Studio Preview 的设备配置提供 375dp 参考宽度，禁止向 XML 根节点写入 `tools:layout_width/height`。
 2. 获取当前区块 Preview 截图，与蓝湖原图对应区块并排或叠加比较，同时以 annotations 的 bbox、间距、字号、颜色和样式数据做数值核对；不得只凭像素差判断通过与否。
 3. 至少检查固定/弹性/等分关系、公共列、top/bottom 垂直对齐、baseline 例外必要性、TextView 裁切与换行、字体映射、间距、颜色、圆角、边框、Preview 占位和可见状态；`app:fontType` 若未在 Preview 执行，以 annotations 与项目映射的静态审计为准，不得据此误判为默认字体；待下载切图只验收占位区域的尺寸和约束，不验收图片内容。
-4. 若差异只涉及已批准拓扑内的尺寸、颜色、文案、占位或资源引用，只修改当前区块并重新渲染；若需要改变容器、锚点、列模型、宽度角色或 GONE 行为，退回 `block_plan_pending`，重新生成并自动审计方案后再实现，自动重规划最多两轮，仍不成立则进入“补充信息暂停态”。
-5. AI 自动修正并重新渲染最多两轮；仍有差异时输出剩余问题，状态保持 `ai_preview_review`，仅就技术差异询问用户补充调整意见或稍后重试；这不是验收确认，未通过前不得结束当前区块或扩大到其他区块。
-6. Preview 无法启动或截图不可读取时，不得声称验收通过，也不得为此运行全量构建；状态保持 `ai_preview_review`，说明技术阻塞，并仅询问用户补充环境信息或稍后重试；这不是验收方式选择。
-7. 通过时输出 `AI_PREVIEW_REVIEW: PASSED`、对比结论和已知未验收项，状态改为 `block_preview_accepted`；下一轮才进入下一块的阶段 2。
+4. 若差异只涉及已批准拓扑内的尺寸、颜色、文案、占位或资源引用，只修改当前区块，重跑定向静态检查后重新渲染；若该静态复查失败，丢弃本次失败修正并保留最近一次定向静态检查通过的实现，记录 `pending_reason=preview_static_recheck_failed` 后进入第 6 条。若需要改变容器、锚点、列模型、宽度角色或 GONE 行为，可自动退回 `block_plan_pending`，重新生成并自动审计方案后再实现；若重规划、实现或其静态复查仍不成立，保留最近一次定向静态检查通过的实现，记录 `pending_reason=preview_replan_exhausted` 后进入第 6 条，不得暂停或阻塞后续区块。
+5. AI 自动修正并重新渲染最多两轮；若仍有视觉差异，按实际结果选择单一 `pending_reason`：`visual_diff_remaining`、`preview_correction_exhausted` 或 `preview_rerender_exhausted`，并记录具体剩余问题后进入第 6 条，不得询问用户、保持阻塞或禁止后续区块。
+6. 除第 7 条 `PASSED` 外，任何无法完成或未通过的 AI Preview 验收均输出 `AI_PREVIEW_REVIEW: PENDING`，记录 `block_id`、一个单一的 `pending_reason`、`remaining_preview_issues` 和 `pending_preview_blocks`，状态改为 `block_preview_pending` 后立即进入 `next_block`。原因包括但不限于 `android_studio_window_not_captured`、`preview_tool_unavailable`、`preview_launch_failed`、`preview_render_failed`、`preview_screenshot_capture_failed`、`preview_screenshot_unreadable`、`visual_comparison_unavailable`、`visual_diff_remaining`、`preview_static_recheck_failed`、`preview_correction_exhausted`、`preview_rerender_exhausted`、`preview_replan_failed`、`preview_replan_exhausted`；其他原因使用可审计的 snake_case 值。该分支不得询问用户、进入“补充信息暂停态”、运行全量构建、声称验收通过或写成用户跳过；同一失败条件下不得在当前区块无限重试。
+7. 通过时输出 `AI_PREVIEW_REVIEW: PASSED`、对比结论和已知未验收项，状态改为 `block_preview_accepted` 后进入 `next_block`。
 
-本变体不提供 Preview 跳过分支；每个区块均必须完成 AI Preview 验收后才能进入下一块。
+本变体不提供 Preview 跳过分支；每个区块都必须发起 AI Preview 验收。任何未得到 `PASSED` 的结果均以 `block_preview_pending` 继续下一块，该状态仅表示待补验，不等同于 `block_preview_accepted` 或 `block_preview_skipped`。
 
 ## 阶段 4：整页组合审计
 
-前置：所有区块均为 `block_preview_accepted`。
+前置：所有区块均已完成实现与定向静态检查，且状态为 `block_preview_accepted` 或 `block_preview_pending`。
 
 1. 进入本阶段时状态为 `page_integration_pending`；只处理页面 shell、滚动容器、区块间 top/bottom 约束、跨区块显隐和最终资源清单。
 2. 禁止未经重新规划修改已完成区块内部；确需改变时，将受影响区块退回阶段 2 并说明原因。
 3. 验证设计宽度及窄/宽场景下的区块连接、滚动范围、最后一个稳定 bottom anchor、资源引用和可见性。检查失败时保持 `page_integration_pending` 并报告问题；需要修改区块内部拓扑时，将对应区块退回阶段 2。
-4. 只有上述整页检查全部通过后才能输出 `PAGE_INTEGRATED`、最终审计和资源清单，并把状态改为 `page_integrated`；若用户要求写文件，同时核对工作树只包含本任务范围及原有无关改动。
+4. 上述整页检查通过且不存在 `block_preview_pending` 时，输出 `PAGE_INTEGRATED`、最终审计和资源清单，并把状态改为 `page_integrated`。
+5. 上述整页检查通过但仍存在 `block_preview_pending` 时，输出 `PAGE_INTEGRATED: PREVIEW_PENDING`、最终静态审计、资源清单与 `pending_preview_blocks`，并把状态改为 `page_integrated_preview_pending`；继续完成其余已授权组合流程，不得因待验收项暂停，也不得声称整页视觉验收通过。后续按“待验收回流”规则补验并清理清单；再次非 `PASSED` 的区块继续留在清单中。若补验产生文件修正，必须重跑受影响检查后才能改为 `page_integrated`。
+6. 若用户要求写文件，同时核对工作树只包含本任务范围及原有无关改动。
 
 ## 补充信息暂停态
 
-- 实际截图不可读取，或目标 Android 模块、页面 shell、宿主样式位置、关键动态状态、可隐藏 View 行为无法唯一确定时，只提出继续当前阶段所需的最小问题并停止。
+- 阶段 1 的蓝湖设计原图不可读取，或目标 Android 模块、页面 shell、宿主样式位置、关键动态状态、可隐藏 View 行为无法唯一确定时，只提出继续当前阶段所需的最小问题并停止。
 - 该状态表示自动流程因关键证据缺失而暂停；用户补充后从原状态继续，仍须完成区块地图和区块方案审计。
+- 已进入 AI Preview 阶段后的任何未通过或无法完成都不是本暂停态；必须按 `AI_PREVIEW_REVIEW: PENDING`、具体 `pending_reason` 和 `remaining_preview_issues` 记录并继续后续流程。
 
 ## 实施前模块与宿主预检
 
