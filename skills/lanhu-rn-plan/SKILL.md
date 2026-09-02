@@ -51,7 +51,25 @@ description: 输入蓝湖设计图详情 URL（含 image_id），使用 lanhu MC
 - `lanhu_get_ai_analyze_page_result`
 - `lanhu_resolve_invite_link`
 
-若 lanhu MCP 不可用：提示用户先启动 lanhu-mcp 并确保 Codex 可见，然后停止。
+以上工具优先通过当前任务已经注入的 MCP tool call 调用。主路径不自行建立 MCP 连接；只有本节有限恢复分支允许使用与当前配置完全相同的只读 STDIO Client。工具目录缺失不等于服务未启动；`fastmcp list`、`tools/list`、stdout 日志或进程退出码都不能作为设计数据。
+
+## MCP 工具可见性与有限恢复（主路径前置）
+
+任务工具目录与 MCP 服务传输状态是两个独立状态。按本 Skill 的 URL 路由和当前阶段计算 `required_tools` 与 `target_key`：
+
+下面的 PRD/邀请路由只在该 Skill 现有输入校验和阶段契约已接受后生效；恢复分支不放宽 `image_id` 等输入硬要求，也不扩展输出流程。
+
+- 设计稿链路使用 `target_key=(url,image_id)`；`recovery_stage=stage1`（阶段 1）只需 `lanhu_get_ai_analyze_design_result`，`recovery_stage=stage2`（阶段 2）需 `lanhu_get_design_annotations`、`lanhu_get_design_slices`。结果缓存跨阶段按 `target_key` 复用，恢复挂起保存 `recovery_stage`、`current_stage_data_pending` 和已成功结果。
+- PRD/原型链路使用 `target_key=(url,docId)`，按当前阶段实际未完成调用计算 `required_tools`，只探测当前阶段需要的 `lanhu_get_pages`、`lanhu_get_ai_analyze_page_result` 等工具，不把设计稿三项误当成必需项。
+- 邀请链路使用 `target_key=(invite_url,sid)`，先只恢复 `lanhu_resolve_invite_link`；解析得到 canonical URL 后，按新的 `docId/image_id` 和当前阶段重新计算 `required_tools`、`target_key` 与 `recovery_stage`。
+
+1. 该恢复分支只适用于当前 `recovery_stage` 的 `required_tools` 尚未完整时。目录缺失不重试：直接记录 `task_tool_catalog=unavailable`，建立临时 `mcp_recovery_pending`，保存 `recovery_stage`、`current_stage_data_pending`、已成功结果及 `target_key`，并输出 `MCP_TOOL_CATALOG_PENDING`。目录可见但原生调用在返回结构化 MCP `CallToolResult` 前发生 `initialize`、连接关闭、协议分帧/传输错误时，先在当前 Client 立即重试一次；仍失败才保留 `task_tool_catalog=available` 并建立/保留同一临时标记。上述两种情况均不等于 lanhu-mcp 未启动，也不触发 `web_schema_fallback`、几何猜测或终止流程；合法 `CallToolResult` 的鉴权/参数/业务错误，以及 envelope 合法但 payload 校验失败，按本 Skill 原有数据规则处理。用户明确回复“继续”或“重试”只触发当前恢复轮，优先于其他审批语义；更换 URL、`image_id`、`docId` 或邀请 `sid` 时废弃旧轮并重新计算。
+2. 仅当 `mcp_recovery_pending` 仍有效且收到明确“继续/重试”时，执行一次当前 `recovery_stage` 的目录重查并计入 `catalog_refresh`。若目录此前为 `unavailable` 且重查后已包含当前阶段全部尚未完成的 `required_tools`，记录 `task_tool_catalog=recovered_via_continue`；若目录此前为 `available`（仅发生传输错误），保留 `task_tool_catalog=available`。目录重查只更新目录字段，不据此提前写 `mcp_transport_status` 或 `mcp_access_mode`；随后立即从首个未完成调用使用原生工具并复用同键结果，待当前阶段所需 native 调用取得可解析的结构化 envelope（包括 `isError=true`）后，才记录 `mcp_transport_status=healthy`、`mcp_access_mode=native_task_tools` 并清除 pending，回到当前阶段。目录重查一旦计入，后续“继续”不得再次刷新；若刷新后 native 即时重试仍失败，不得再次建立 pending，直接进入尚未使用的 `stdio_probe`，无可用 launcher 时输出 `FAIL_FAST: MCP_RECOVERY_EXHAUSTED`。
+   - 目录重查发生即记录 `mcp_recovery_steps=catalog_refresh`；若重查后仍缺少当前阶段工具，不发起不可见的原生调用，直接进入步骤 3。STDIO 介入后将该字段更新为 `catalog_refresh_then_stdio_bridge`。
+3. 目录仍缺少当前阶段所需工具，或原生调用再次在结构化结果前传输失败，且能读取已配置的 STDIO 启动方式时，最多执行一次受控只读 `stdio_probe`：使用完全相同的 `command`、`args`、`cwd`、`env`（或已确认的 `run_lanhu_mcp_stdio` launcher），以分离参数依次发送 `initialize`、`notifications/initialized`、`tools/list`。不得猜路径、回显 Cookie/环境变量或调用写入工具；Windows 路径不得拼成未经转义的单字符串，STDOUT 只接受 MCP JSON-RPC 帧，诊断留在 STDERR。若 `catalog_refresh` 已计入，不得重新建立 pending 或刷新目录；探测 Client 与后续调用 Client 可以是两个短会话，但必须指向同一已配置的 server/launcher。
+4. 只有握手响应和 `tools/list` 均可解析且包含当前阶段尚未完成调用所需的 `required_tools` 才记 `stdio_probe=passed` 并同步记 `mcp_transport_status=healthy`；缺工具记 `stdio_probe=failed`、`mcp_transport_status=healthy` 并以 `reason=required_tool_missing` 结束恢复，协议/超时/进程退出记 `stdio_probe=failed`、`mcp_transport_status=unhealthy`。探测成功后立即用同一 launcher 发起当前阶段尚未完成的 `tools/call`，不等待下一次“继续”；若后续 `tools/call` 在结构化结果前传输失败，保留 `stdio_probe=passed`、覆盖 `mcp_transport_status=unhealthy`，在当前 Client 立即重试一次；重试若取得可解析的结构化 `CallToolResult`（包括 `isError=true`），立即恢复 `mcp_transport_status=healthy`，仍失败则按本轮预算 `FAIL_FAST`；`tools/list` 本身永远不算设计数据。
+5. 以 `(target_key,tool_name,canonical_args)` 为结果键复用已成功且仍有效的结果，只调用当前阶段缺失或明确失效项。解析到结构化 `CallToolResult`（包括 `isError=true`）即为该项取得 envelope；当前阶段所需 envelope 全部到齐后，立即记录 `mcp_transport_status=healthy`、清除 `mcp_recovery_pending` 并回到当前阶段，合法 envelope 的接口错误或 payload 问题仍按本 Skill 原有规则处理，不把它们当作传输失败。只要本轮至少有一项调用经 STDIO 补齐，就记录 `mcp_access_mode=stdio_recovery`、`mcp_recovery_steps=catalog_refresh_then_stdio_bridge`；否则在 native envelope 到齐后记录 `mcp_access_mode=native_task_tools`。恢复得到的结果直接并入当前阶段数据链，阶段推进不清除 `target_key` 缓存，也不得重复成功调用。
+6. 每个 `(target_key,recovery_stage)` 的恢复预算固定为：目录重查最多 1 次、STDIO 探测最多 1 次、补齐当前阶段未完成调用最多 1 轮；当前 Client/恢复轮内的瞬时传输错误只立即重试 1 次。阶段推进可开启下一阶段自己的恢复轮，但不清除同一 `target_key` 的结果缓存；`mcp_retry_count` 只按 `target_key` 累计额外的传输重试次数，不包含 `catalog_refresh`、`stdio_probe` 或结构化业务错误，重复“继续”不得重置计数。预算耗尽或无法启动/握手/发起恢复调用时输出 `FAIL_FAST: MCP_RECOVERY_EXHAUSTED` 及 `reason=native_call_transport_failed|stdio_transport_unhealthy|required_tool_missing|stdio_call_transport_failed|recovery_budget_exhausted` 并停止。仅目录暂缺、一次瞬时传输错误或 STDIO 探测成功但原生目录仍未注入，均不得触发 schema fallback。
 
 ## URL 与工具路由（强制）
 
@@ -142,12 +160,13 @@ description: 输入蓝湖设计图详情 URL（含 image_id），使用 lanhu MC
 
 ## 网页 schema 兜底链路（仅失败时启用）
 
-仅当以下任一条件成立时触发兜底：
+仅在对应 `tools/call` 已返回可解析的结构化 `CallToolResult` 后，以下接口或 payload 问题才可触发兜底：
 
-- `lanhu_get_design_annotations` 调用失败
-- annotations 缺关键字段（`unit/layers/measurements`）
-- `lanhu_get_design_slices` 调用失败且无法获取关键资源信息
-- `lanhu_get_ai_analyze_design_result` 调用失败（仅影响阶段 1 语义描述时可降级为 `EMPTY`）
+- `lanhu_get_design_annotations` 返回接口错误，或 annotations payload 缺关键字段（`unit/layers/measurements`）
+- `lanhu_get_design_slices` 返回接口错误且无法获取关键资源信息
+- `lanhu_get_ai_analyze_design_result` 返回接口错误且当前阶段无法按既有规则降级为 `EMPTY`
+
+仅因当前任务工具目录暂缺、STDIO 探测成功但原生目录未恢复、或一次瞬时 `initialize`/传输错误，不触发 `web_schema_fallback`（本条优先于下面触发条件）；先按“MCP 工具可见性与有限恢复”处理。只有已经发起对应 `tools/call` 并确认结构化结果存在接口/数据问题，才按本节既定条件判断是否启用 schema fallback。
 
 触发兜底后：
 
@@ -177,6 +196,8 @@ description: 输入蓝湖设计图详情 URL（含 image_id），使用 lanhu MC
    - `FAIL_FAST: SCHEMA_FETCH_FAILED`
 6. 进入兜底后 schema 解析失败：
    - `FAIL_FAST: SCHEMA_PARSE_FAILED`
+7. MCP 工具目录刷新与 STDIO 恢复预算耗尽：
+   - `FAIL_FAST: MCP_RECOVERY_EXHAUSTED`
 
 默认一律硬失败，禁止静默降级为估算模式。
 
@@ -289,6 +310,13 @@ description: 输入蓝湖设计图详情 URL（含 image_id），使用 lanhu MC
 
 - `tool_route=design_chain|prd_chain`
 - `mcp_calls`
+- `recovery_stage=<当前阶段>`
+- `task_tool_catalog=available|recovered_via_continue|unavailable`
+- `stdio_probe=not_run|passed|failed`
+- `mcp_transport_status=healthy|unhealthy|not_probed`
+- `mcp_access_mode=native_task_tools|stdio_recovery`
+- `mcp_recovery_steps=none|catalog_refresh|catalog_refresh_then_stdio_bridge`
+- `mcp_retry_count=<非负整数，按 target_key 累计额外传输重试次数；不含 catalog_refresh、stdio_probe 或结构化业务错误>`
 - `selection_key=image_id`
 - `selected_image_id`
 - `source_mode=mcp_annotations_primary|web_schema_fallback`
@@ -298,12 +326,14 @@ description: 输入蓝湖设计图详情 URL（含 image_id），使用 lanhu MC
 - `text_source_priority`
 - `data_source=text/icon/spacing=annotations|dds_schema`
 - `fallback_reason`（仅兜底时必填）
+原生目录直接可用且当前阶段未发生即时重试时记录 `task_tool_catalog=available`、`stdio_probe=not_run`、`mcp_transport_status=healthy`、`mcp_access_mode=native_task_tools`、`mcp_recovery_steps=none`。仅当同一 `target_key` 的 stage1/stage2 均未发生额外传输重试时，`mcp_retry_count=0`；当前阶段发生即时重试时，在跨阶段累计值上按实际额外次数增加。目录刷新只更新 `task_tool_catalog`：仅此前为 `unavailable` 且重查补齐时记录 `recovered_via_continue`，仅传输故障时保留 `available`；当前阶段的原生调用取得合法 envelope 后才记录 `mcp_transport_status=healthy`、`mcp_access_mode=native_task_tools`。“STDIO 恢复”只要本轮至少补齐一项且当前阶段所需 envelope 到齐就记录 `mcp_transport_status=healthy`、`mcp_access_mode=stdio_recovery`、`mcp_recovery_steps=catalog_refresh_then_stdio_bridge`；恢复挂起时只输出临时状态，不伪造完整 A) 审计字段。
 
 ## 阶段 1（定位/选中/默认承载）
+进入本阶段时设置 `recovery_stage=stage1`。
 
 1. 解析 `LANHU_URL`，提取 `image_id`
 2. 不调用 `lanhu_get_designs` 进行筛选；直接以该 `image_id` 作为唯一目标
-3. 调用 `lanhu_get_ai_analyze_design_result(url, image_ids=[image_id])` 获取视觉核对信息（失败可记 `EMPTY`）
+3. 按上述 MCP 恢复规则调用 `lanhu_get_ai_analyze_design_result(url, image_ids=[image_id])` 获取视觉核对信息（失败可记 `EMPTY`）；恢复轮已有同一 `target_key` 的结构化结果时复用，不重复调用。
 4. 默认 `PRESENTATION` 规则：
    - `bottom_sheet`：含“底部弹窗/底部弹出/bottom sheet”
    - `modal`：含“弹窗/对话框/提示/确认/dialog”
@@ -319,6 +349,9 @@ description: 输入蓝湖设计图详情 URL（含 image_id），使用 lanhu MC
 
 前置：`selected_image_id` 已确定。
 
+进入本阶段时先设置 `recovery_stage=stage2`。跨阶段只保留同一 `target_key` 的结果缓存、`mcp_calls` 与累计 `mcp_retry_count`；`task_tool_catalog` 在本阶段重新观测，`stdio_probe=not_run`、`mcp_transport_status=not_probed`、`mcp_recovery_steps=none`，`mcp_access_mode` 待本阶段取得合法 envelope 后填写。A) 审计中除 `mcp_calls`、`mcp_retry_count` 外的恢复字段均描述阶段 2。
+调用前复用同键的有效 annotations/slices 结果；阶段 2 仍优先检查并调用当前任务原生工具，不继承阶段 1 的 `mcp_access_mode`。只有本阶段恢复分支选中 STDIO 后，才用同一已配置 launcher 补齐当前阶段缺失调用。
+
 1. 调用 `lanhu_get_design_annotations(url, image_id)` 获取结构化标注（主路径）
 2. 校验 `unit` 与关键字段（`layers/measurements`）
 3. 调用 `lanhu_get_design_slices(url, image_id)` 获取切图与资源信息
@@ -327,7 +360,8 @@ description: 输入蓝湖设计图详情 URL（含 image_id），使用 lanhu MC
    - 文本值按已归一的 `fontSize` / `lineHeight` / `letterSpacing` 输出
    - 间距优先使用 measurements，缺项时回退几何关系
    - 圆角优先读取 `annotations.style.border_radius`
-5. 若步骤 1~3 任一失败或缺关键字段，触发 `web_schema_fallback`
+5. 仅当步骤 1~3 中相关 `tools/call` 已返回可解析的结构化 `CallToolResult`，且命中本节列出的接口错误或关键 payload 条件时，触发 `web_schema_fallback`；AI 分析若按既有规则可降级为 `EMPTY` 则不触发，否则仅按本节 AI 条件处理。
+   - 若目录缺失、仍处于 `mcp_recovery_pending` 或在结构化结果前传输失败，先按上述恢复分支处理，不触发 fallback。
 6. 输出 A) 审计区（必须完整）
 7. 输出 B) 规格表（<=3 层组件树）
 8. 输出 C) React Native 文件内容（仅 TSX + `StyleSheet.create`）
